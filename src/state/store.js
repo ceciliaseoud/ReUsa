@@ -1,3 +1,4 @@
+// controla as funcionalidades do app, como login, registro, feed, threads, notificações, pontos de coleta, favoritos, perfil, busca e formulários de postagem
 import { create } from 'zustand';
 import { api, clearToken, getToken, setToken } from '../services/api';
 import { fallbackPosts } from '../data/fallback-posts';
@@ -5,6 +6,27 @@ import { fallbackPosts } from '../data/fallback-posts';
 const initialFormState = {
   interests: []
 };
+
+let messageClearRevision = 0;
+const notificationThreadId = (notification) => {
+  try { return new URL(notification.link, 'https://reusa.invalid').searchParams.get('thread'); }
+  catch { return null; }
+};
+
+function postRequestBody(payload, editing = false) {
+  const images = Array.isArray(payload.images) ? payload.images : payload.image instanceof File ? [payload.image] : [];
+  const videos = Array.isArray(payload.videos) ? payload.videos : [];
+  if (!images.length && !videos.length && !(editing && (Array.isArray(payload.images) || Array.isArray(payload.videos)))) return payload;
+  const body = new FormData();
+  Object.entries(payload).forEach(([key, value]) => {
+    if (!['image', 'images', 'videos'].includes(key) && value !== undefined) {
+      body.append(key, value !== null && typeof value === 'object' ? JSON.stringify(value) : value);
+    }
+  });
+  images.forEach((file) => body.append('images', file));
+  videos.forEach((file) => body.append('videos', file));
+  return body;
+}
 
 export const useAppStore = create((set, get) => ({
   initialized: false,
@@ -70,13 +92,31 @@ export const useAppStore = create((set, get) => ({
     set({ posts: result.posts || fallbackPosts });
   },
   loadThreads: async () => {
+    const revision = messageClearRevision;
     const result = await api.threads();
-    set({ threads: result.threads || [] });
+    if (revision === messageClearRevision) set({ threads: result.threads || [] });
   },
   loadNotifications: async () => {
+    const revision = messageClearRevision;
     const result = await api.notifications();
-    set({ notifications: result.notifications || [] });
-    return result.notifications || [];
+    if (revision === messageClearRevision) set({ notifications: result.notifications || [] });
+    return get().notifications;
+  },
+  clearMessages: async (threadId) => {
+    const result = threadId ? await api.clearThreadMessages(threadId) : await api.clearAllMessages();
+    if (!result?.ok) throw new Error('Não foi possível limpar as mensagens. Tente novamente.');
+    const clearedAt = result.clearedAt || new Date().toISOString();
+    const cutoff = Date.parse(clearedAt);
+    // Ignore requests started before the clear, so an old poll cannot restore its badge.
+    messageClearRevision += 1;
+    set((state) => ({
+      threads: state.threads.filter((thread) => (threadId && thread.id !== threadId) || Date.parse(thread.time) > cutoff),
+      notifications: state.notifications.map((item) => item.type === 'message' && !item.readAt &&
+        (!threadId || notificationThreadId(item) === threadId) && Date.parse(item.createdAt) <= cutoff
+        ? { ...item, readAt: clearedAt } : item)
+    }));
+    await Promise.all([get().loadThreads(), get().loadNotifications()]);
+    return result;
   },
   readThreadNotifications: async (threadId) => {
     await api.readThreadNotifications(threadId);
@@ -116,12 +156,7 @@ export const useAppStore = create((set, get) => ({
     return result.user;
   },
   createPost: async (payload) => {
-    const body = payload.image instanceof File ? Object.entries(payload).reduce((formData, [key, value]) => {
-      if (key !== 'image' && value !== undefined) formData.append(key, value);
-      return formData;
-    }, new FormData()) : payload;
-    if (payload.image instanceof File) body.append('image', payload.image);
-    const result = await api.createPost(body);
+    const result = await api.createPost(postRequestBody(payload));
     set((state) => ({ posts: [result.post, ...state.posts] }));
     return result.post;
   },
@@ -147,7 +182,7 @@ export const useAppStore = create((set, get) => ({
     return result;
   },
   updatePost: async (postId, payload) => {
-    const result = await api.updatePost(postId, payload);
+    const result = await api.updatePost(postId, postRequestBody(payload, true));
     set((state) => ({ posts: state.posts.map((post) => post.id === postId ? result.post : post) }));
     return result.post;
   },

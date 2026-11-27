@@ -5,10 +5,15 @@ const fs = require('node:fs');
 const http = require('node:http');
 const os = require('node:os');
 const path = require('node:path');
+const { requiredTransport } = require('./transport-flow');
 
 let server;
 let baseUrl;
 let dataDir;
+let routingServer;
+let routingBaseUrl;
+let routingRequests = 0;
+const distributedNotifications = new Map();
 
 function availablePort() {
   return new Promise((resolve, reject) => {
@@ -43,11 +48,43 @@ async function request(pathname, options = {}) {
 
 before(async () => {
   dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reusa-test-'));
+  routingServer = http.createServer((req, res) => {
+    if (req.url.startsWith('/notifications/')) {
+      const userId = decodeURIComponent(req.url.slice('/notifications/'.length));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ notifications: distributedNotifications.get(userId) || [] }));
+    }
+    routingRequests += 1;
+    if (!req.url.startsWith('/route/v1/driving/')) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({ code: 'InvalidUrl' }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({
+      code: 'Ok',
+      routes: [{
+        distance: 1234.56,
+        duration: 567.89,
+        geometry: {
+          type: 'LineString',
+          coordinates: [[-54.7083, -2.4431], [-54.7, -2.44]]
+        }
+      }]
+    }));
+  });
+  await new Promise((resolve, reject) => {
+    routingServer.once('error', reject);
+    routingServer.listen(0, '127.0.0.1', () => {
+      routingServer.off('error', reject);
+      resolve();
+    });
+  });
+  routingBaseUrl = `http://127.0.0.1:${routingServer.address().port}`;
   const port = await availablePort();
   baseUrl = `http://127.0.0.1:${port}`;
   server = spawn(process.execPath, ['backend.js'], {
     cwd: path.resolve(__dirname, '..'),
-    env: { ...process.env, PORT: String(port), DATA_DIR: dataDir, JWT_SECRET: 'test-secret-not-for-production' },
+    env: { ...process.env, NODE_ENV: 'test', PORT: String(port), DATA_DIR: dataDir, JWT_SECRET: 'test-secret-not-for-production', ROUTING_BASE_URL: routingBaseUrl, NOTIFICATION_SERVICE_URL: routingBaseUrl, ADMIN_EMAILS: 'mariana@reusa.com, carlos@reusa.com' },
     stdio: 'ignore'
   });
   await waitForServer();
@@ -55,6 +92,7 @@ before(async () => {
 
 after(() => {
   if (server && !server.killed) server.kill();
+  if (routingServer) routingServer.close();
   fs.rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -79,13 +117,42 @@ test('seeded user can authenticate and access protected data', async () => {
   assert.equal(profile.payload.user.id, 'user-mariana');
 });
 
-test('registration validates data and persists a new account', async () => {
-  const invalid = await request('/api/auth/register', {
+test('every configured administrator email receives administrator access', async () => {
+  const login = await request('/api/auth/login', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: 'A', email: 'invalid', password: 'short', city: 'SP' })
+    body: JSON.stringify({ email: 'carlos@reusa.com', password: '12345678' })
   });
-  assert.equal(invalid.response.status, 400);
+  assert.equal(login.response.status, 200);
+
+  const dashboard = await request('/api/admin/dashboard', { headers: { Authorization: `Bearer ${login.payload.token}` } });
+  assert.equal(dashboard.response.status, 200);
+});
+
+test('registration validates data and persists a new account', async () => {
+  const missingFields = await request('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'A', email: 'valid@example.test', password: 'senha-segura-123', city: '' })
+  });
+  assert.equal(missingFields.response.status, 400);
+  assert.equal(missingFields.payload.error, 'Informe nome, e-mail, senha e cidade para criar a conta.');
+
+  const shortPassword = await request('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'A', email: 'valid@example.test', password: 'short', city: 'SP' })
+  });
+  assert.equal(shortPassword.response.status, 400);
+  assert.equal(shortPassword.payload.error, 'A senha precisa ter pelo menos 8 caracteres.');
+
+  const invalidEmail = await request('/api/auth/register', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'A', email: 'usuario@gmail', password: 'senha-segura-123', city: 'SP' })
+  });
+  assert.equal(invalidEmail.response.status, 400);
+  assert.equal(invalidEmail.payload.error, 'Informe um e-mail válido, como nome@gmail.com, nome@outlook.com ou outro domínio existente.');
 
   const email = `test-${Date.now()}@example.test`;
   const registration = await request('/api/auth/register', {
@@ -100,7 +167,8 @@ test('registration validates data and persists a new account', async () => {
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ email, password: 'senha-segura-123' })
   });
-  assert.equal(login.response.status, 200);
+  assert.equal(login.response.status, 403);
+  assert.equal(login.payload.error, 'Confirme seu e-mail antes de entrar');
 });
 
 test('business registration stores public neighborhood without exposing protected address', async () => {
@@ -118,9 +186,94 @@ test('business registration stores public neighborhood without exposing protecte
   assert.equal(profile.payload.user.address, 'Rua Protegida, 100');
 });
 
+test('multipart post submission preserves all required item fields', async () => {
+  const email = `multipart-${Date.now()}@example.test`;
+  const registration = await request('/api/auth/register', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: 'Publicador de teste', email, password: 'senha-segura-123', city: 'Sao Paulo, SP' })
+  });
+  assert.equal(registration.response.status, 201);
+
+  const form = new FormData();
+  form.set('title', 'Cadeira para reutilizar');
+  form.set('description', 'Cadeira em bom estado para doação.');
+  form.set('category', 'Móveis');
+  form.set('goal', 'Doação');
+  form.set('location', 'Pinheiros, São Paulo, SP');
+  Object.entries(requiredTransport).forEach(([key, value]) => form.set(key, value));
+  form.set('images', new Blob(['imagem de teste'], { type: 'image/png' }), 'cadeira.png');
+
+  const created = await request('/api/posts', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${registration.payload.token}` },
+    body: form
+  });
+  assert.equal(created.response.status, 201);
+  assert.equal(created.payload.post.title, 'Cadeira para reutilizar');
+  assert.equal(created.payload.post.category, 'Móveis');
+});
+
+test('post media supports videos, preserves edits and rejects invalid uploads atomically', async () => {
+  await require('./post-media-flow').exercisePostMedia(request, {
+    rawFetch: (url, options) => fetch(`${baseUrl}${url}`, options)
+  });
+});
+
+test('new posts require transport answers and partial edits preserve them', async () => {
+  await require('./transport-flow').exerciseTransportRequirements(request);
+});
+
 test('CNPJ lookup rejects malformed identifiers before contacting the external service', async () => {
   const lookup = await request('/api/businesses/cnpj/00000000000000');
   assert.equal(lookup.response.status, 400);
+});
+
+test('administrator can save collection point edits from the form', async () => {
+  const login = await request('/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: 'mariana@reusa.com', password: '12345678' })
+  });
+  assert.equal(login.response.status, 200);
+
+  const update = await request('/api/admin/collection-points/point-1', {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${login.payload.token}` },
+    body: JSON.stringify({
+      name: 'EcoCentro Santarém',
+      location: 'Centro, Santarém - PA',
+      categories: ['Eletrônicos', 'plástico', 'metal'],
+      hours: '08:00 – 18:00'
+    })
+  });
+
+  assert.equal(update.response.status, 200);
+  assert.equal(update.payload.point.location, 'Centro, Santarém - PA');
+  assert.equal(update.payload.point.hours, '08:00 – 18:00');
+  assert.deepEqual(update.payload.point.categories, ['Eletrônicos', 'plástico', 'metal']);
+});
+
+test('map route validates coordinates and returns a sanitized cached route', async () => {
+  routingRequests = 0;
+  const invalid = await request('/api/map-route?fromLat=91&fromLng=-54.7&toLat=-2.44&toLng=-54.6');
+  assert.equal(invalid.response.status, 400);
+  assert.equal(routingRequests, 0);
+
+  const path = '/api/map-route?fromLat=-2.4431&fromLng=-54.7083&toLat=-2.44&toLng=-54.7';
+  const first = await request(path);
+  assert.equal(first.response.status, 200);
+  assert.equal(first.payload.cached, false);
+  assert.deepEqual(first.payload.route, {
+    geometry: { type: 'LineString', coordinates: [[-54.7083, -2.4431], [-54.7, -2.44]] },
+    distance: 1235,
+    duration: 568
+  });
+  assert.equal(routingRequests, 1);
+
+  const second = await request(path);
+  assert.equal(second.response.status, 200);
+  assert.equal(second.payload.cached, true);
+  assert.equal(routingRequests, 1);
 });
 
 test('favorites, negotiation status and reviews persist with permission checks', async () => {
@@ -137,11 +290,17 @@ test('favorites, negotiation status and reviews persist with permission checks',
 
   const created = await request('/api/posts', {
     method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerToken}` },
-    body: JSON.stringify({ title: 'Mesa circular', description: 'Mesa em bom estado para doação.', category: 'Móveis', condition: 'Bom estado', goal: 'Doação', location: 'Centro, Sao Paulo, SP', imageUrl: 'https://images.example.test/mesa.jpg' })
+    body: JSON.stringify({ ...requiredTransport, title: 'Mesa circular', description: 'Mesa em bom estado para doação.', category: 'Móveis', condition: 'Bom estado', goal: 'Doação', location: 'Belem, PA', imageUrl: 'https://images.example.test/mesa.jpg' })
   });
   assert.equal(created.response.status, 201);
   const postId = created.payload.post.id;
   assert.equal(created.payload.post.status, 'Disponível');
+  assert.equal(created.payload.post.location, 'Belem, PA');
+  assert.equal(created.payload.post.author.city, 'Sao Paulo, SP');
+  const feed = await request('/api/feed');
+  const feedPost = feed.payload.posts.find((post) => post.id === postId);
+  assert.equal(feedPost.location, 'Belem, PA');
+  assert.equal(feedPost.author.city, 'Sao Paulo, SP');
 
   const interestedRegistration = await request('/api/auth/register', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -160,19 +319,45 @@ test('favorites, negotiation status and reviews persist with permission checks',
   const thread = await request('/api/messages/threads', { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${interestedToken}` }, body: JSON.stringify({ postId }) });
   assert.equal(thread.response.status, 201);
 
+  const donationNegotiation = await request(`/api/posts/${postId}/negotiation`, { headers: { Authorization: `Bearer ${interestedToken}` } });
+  assert.equal(donationNegotiation.response.status, 200);
+  const donationProposal = await request(`/api/negotiations/${donationNegotiation.payload.negotiation.id}/proposal`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${interestedToken}` },
+    body: JSON.stringify({ amountCents: 2500, method: 'pix' })
+  });
+  assert.equal(donationProposal.response.status, 400);
+
   const reserve = await request(`/api/posts/${postId}/reserve`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerToken}` }, body: JSON.stringify({ interestedId }) });
   assert.equal(reserve.response.status, 200);
   assert.equal(reserve.payload.post.status, 'Reservado');
 
+  const donationPayment = await request(`/api/negotiations/${donationNegotiation.payload.negotiation.id}/payment`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${interestedToken}` },
+    body: JSON.stringify({ amountCents: 2500, currency: 'BRL', method: 'pix', idempotencyKey: `donation-${suffix}-payment` })
+  });
+  assert.equal(donationPayment.response.status, 400);
+
   const completed = await request(`/api/posts/${postId}/complete`, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${ownerToken}` }, body: JSON.stringify({ outcome: 'Doado' }) });
-  assert.equal(completed.response.status, 200);
-  assert.equal(completed.payload.post.status, 'Doado');
+  assert.equal(completed.response.status, 409);
+  const deliveryHeaders = token => ({ 'Content-Type': 'application/json', Authorization: `Bearer ${token}` });
+  const proposedDelivery = await request(`/api/negotiations/${donationNegotiation.payload.negotiation.id}/collection`, { method: 'POST', headers: deliveryHeaders(ownerToken), body: JSON.stringify({ mode: 'dropoff', scheduledFor: new Date(Date.now()+86400000).toISOString(), collectionPointId: 'point-1' }) });
+  assert.equal(proposedDelivery.response.status, 201);
+  assert.equal(proposedDelivery.payload.collection.collectionPoint.id, 'point-1');
+  assert.ok(proposedDelivery.payload.collection.address.includes(proposedDelivery.payload.collection.collectionPoint.name));
+  const collectionId = proposedDelivery.payload.collection.id;
+  assert.equal((await request(`/api/collection-deliveries/${collectionId}/accept`, { method: 'POST', headers: deliveryHeaders(interestedToken) })).response.status, 200);
+  const receipt = await request(`/api/collection-deliveries/${collectionId}/confirm`, { method: 'POST', headers: deliveryHeaders(interestedToken) });
+  assert.equal(receipt.response.status, 200);
+  assert.equal(receipt.payload.collection.status, 'completed');
+  assert.equal((await request(`/api/posts/${postId}`)).payload.post.status, 'Doado');
 
   const distributed = await request('/api/distributed/status');
   assert.equal(distributed.response.status, 200);
   assert.equal(distributed.payload.delivery, 'at-least-once');
   // Sem AMQP_URL no teste, a outbox preserva o evento para entrega posterior.
-  assert.equal(distributed.payload.pendingEvents, 3);
+  assert.ok(distributed.payload.pendingEvents >= 3);
 
   const negotiation = await request(`/api/posts/${postId}/negotiation`, { headers: { Authorization: `Bearer ${interestedToken}` } });
   assert.equal(negotiation.response.status, 200);
@@ -183,6 +368,183 @@ test('favorites, negotiation status and reviews persist with permission checks',
   const reviews = await request(`/api/users/${ownerRegistration.payload.user.id}/reviews`);
   assert.equal(reviews.payload.reputation.count, 1);
   assert.equal(reviews.payload.reputation.rating, 5);
+
+  const readThreadNotifications = await request(`/api/notifications/read-thread/${thread.payload.thread.id}`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${ownerToken}` }
+  });
+  assert.equal(readThreadNotifications.response.status, 200);
+});
+
+test('sale posts allow money offers and are completed as sold', async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const headers = { 'Content-Type': 'application/json' };
+  const owner = await request('/api/auth/register', {
+    method: 'POST', headers,
+    body: JSON.stringify({ name: 'Vendedor de teste', email: `seller-${suffix}@example.test`, password: 'senha-segura-123', city: 'Sao Paulo, SP' })
+  });
+  const interested = await request('/api/auth/register', {
+    method: 'POST', headers,
+    body: JSON.stringify({ name: 'Comprador de teste', email: `buyer-${suffix}@example.test`, password: 'senha-segura-123', city: 'Belem, PA' })
+  });
+  assert.equal(owner.response.status, 201);
+  assert.equal(interested.response.status, 201);
+
+  const ownerAuth = { ...headers, Authorization: `Bearer ${owner.payload.token}` };
+  const interestedAuth = { ...headers, Authorization: `Bearer ${interested.payload.token}` };
+  const created = await request('/api/posts', {
+    method: 'POST', headers: ownerAuth,
+    body: JSON.stringify({ ...requiredTransport, title: 'Luminária à venda', description: 'Luminária em ótimo estado.', category: 'Móveis', condition: 'Bom estado', goal: 'Venda', location: 'Belem, PA', imageUrl: 'https://images.example.test/luminaria.jpg' })
+  });
+  assert.equal(created.response.status, 201);
+  assert.equal(created.payload.post.goal, 'Venda');
+  assert.equal(created.payload.post.chipIcon, 'sell');
+  const postId = created.payload.post.id;
+
+  const thread = await request('/api/messages/threads', { method: 'POST', headers: interestedAuth, body: JSON.stringify({ postId }) });
+  assert.equal(thread.response.status, 201);
+  const negotiation = await request(`/api/posts/${postId}/negotiation`, { headers: interestedAuth });
+  assert.equal(negotiation.response.status, 200);
+
+  const proposal = await request(`/api/negotiations/${negotiation.payload.negotiation.id}/proposal`, {
+    method: 'POST', headers: interestedAuth,
+    body: JSON.stringify({ amountCents: 2500, method: 'card' })
+  });
+  assert.equal(proposal.response.status, 201);
+  assert.equal(proposal.payload.proposal.status, 'pending');
+
+  const accepted = await request(`/api/negotiations/${negotiation.payload.negotiation.id}/proposal`, {
+    method: 'PATCH', headers: ownerAuth,
+    body: JSON.stringify({ decision: 'accepted', expectedProposalCreatedAt: proposal.payload.proposal.createdAt })
+  });
+  assert.equal(accepted.response.status, 200);
+  assert.equal(accepted.payload.proposal.status, 'accepted');
+  assert.equal(accepted.payload.reserved, true);
+  const reserved = await request(`/api/posts/${postId}`, { headers: ownerAuth });
+  assert.equal(reserved.response.status, 200);
+  assert.equal(reserved.payload.post.status, 'Reservado');
+  const buyerNegotiation = await request(`/api/posts/${postId}/negotiation`, { headers: interestedAuth });
+  assert.equal(buyerNegotiation.payload.negotiation.proposalStatus, 'accepted');
+  assert.equal(buyerNegotiation.payload.negotiation.status, 'reserved');
+
+  const negotiationId = negotiation.payload.negotiation.id;
+  const outsider = await request('/api/auth/login', { method:'POST', headers, body:JSON.stringify({ email:'mariana@reusa.com', password:'12345678' }) });
+  assert.equal((await request(`/api/negotiations/${negotiationId}/collection`)).response.status,401);
+  assert.equal((await request(`/api/negotiations/${negotiationId}/collection`, { headers: { Authorization:`Bearer ${outsider.payload.token}` } })).response.status,403);
+
+  const sendDelivery = (url, headers, body = {}, method = 'POST') => request(url, { method, headers, body: JSON.stringify(body) });
+  const paymentBody = { amountCents: 2500, currency: 'BRL', method: 'card', idempotencyKey: `sale-${suffix}-payment` };
+  assert.equal((await sendDelivery(`/api/negotiations/${negotiationId}/payment`, interestedAuth, paymentBody)).response.status, 409);
+  const collectionBody = { mode: 'pickup', scheduledFor: new Date(Date.now()+86400000).toISOString(), address: 'Rua do Encontro, 100, Belém, PA' };
+  assert.equal((await sendDelivery(`/api/negotiations/${negotiationId}/collection`, ownerAuth, { ...collectionBody, scheduledFor: new Date().toISOString() })).response.status, 400);
+  assert.equal((await sendDelivery(`/api/negotiations/${negotiationId}/collection`, ownerAuth, { ...collectionBody, mode: 'dropoff', collectionPointId: 'missing' })).response.status, 400);
+  let proposed = await sendDelivery(`/api/negotiations/${negotiationId}/collection`, ownerAuth, collectionBody);
+  assert.equal(proposed.response.status, 201);
+  let collectionId = proposed.payload.collection.id;
+  assert.equal(proposed.payload.collection.qrCodeDataUrl, undefined);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/accept`, ownerAuth)).response.status, 409);
+  assert.equal((await sendDelivery(`/api/negotiations/${negotiationId}/payment`, interestedAuth, paymentBody)).response.status, 409);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/confirm`, interestedAuth)).response.status, 409);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/status`, interestedAuth, { status:'cancelled' }, 'PATCH')).response.status, 200);
+  proposed = await sendDelivery(`/api/negotiations/${negotiationId}/collection`, interestedAuth, collectionBody);
+  assert.equal(proposed.response.status, 201);
+  collectionId = proposed.payload.collection.id;
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/accept`, interestedAuth)).response.status, 409);
+  const agreed = await sendDelivery(`/api/collection-deliveries/${collectionId}/accept`, ownerAuth);
+  assert.equal(agreed.response.status, 200);
+  assert.equal(agreed.payload.collection.paymentReady, true);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/confirm`, interestedAuth)).response.status, 409);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/status`, ownerAuth, { status:'in_transit' }, 'PATCH')).response.status, 409);
+  assert.equal((await sendDelivery(`/api/posts/${postId}/status`, ownerAuth, { status:'Disponível' }, 'PATCH')).response.status, 409);
+  assert.equal((await sendDelivery(`/api/negotiations/${negotiationId}/payment`, interestedAuth, { ...paymentBody, amountCents: 1000 })).response.status, 400);
+  assert.equal((await request(`/api/negotiations/${negotiationId}/collection`, { headers:interestedAuth })).payload.collection.paymentLocked,false);
+  const payment = await request(`/api/negotiations/${negotiation.payload.negotiation.id}/payment`, {
+    method: 'POST', headers: interestedAuth,
+    body: JSON.stringify({ amountCents: 2500, currency: 'BRL', method: 'card', idempotencyKey: `sale-${suffix}-payment` })
+  });
+  assert.equal(payment.response.status, 201);
+  assert.equal(payment.payload.payment.status, 'succeeded');
+
+  const completed = await request(`/api/posts/${postId}/complete`, {
+    method: 'POST', headers: ownerAuth,
+    body: JSON.stringify({ outcome: 'Vendido' })
+  });
+  assert.equal(completed.response.status, 409);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/status`, ownerAuth, { status:'cancelled' }, 'PATCH')).response.status, 409);
+  assert.equal((await sendDelivery(`/api/negotiations/${negotiationId}/payment`, interestedAuth, { ...paymentBody, idempotencyKey: `duplicate-${suffix}-payment` })).response.status, 409);
+  assert.equal((await sendDelivery(`/api/negotiations/${negotiationId}/payment`, interestedAuth, paymentBody)).response.status, 200);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/confirm`, ownerAuth, { token:'forged' })).response.status, 409);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/status`, interestedAuth, { status:'in_transit' }, 'PATCH')).response.status, 409);
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/status`, ownerAuth, { status:'in_transit' }, 'PATCH')).response.status, 200);
+  const receipt = await sendDelivery(`/api/collection-deliveries/${collectionId}/confirm`, interestedAuth);
+  assert.equal(receipt.response.status, 200);
+  assert.equal(receipt.payload.collection.status, 'completed');
+  assert.equal((await sendDelivery(`/api/collection-deliveries/${collectionId}/confirm`, interestedAuth)).response.status, 200);
+  assert.equal((await request(`/api/posts/${postId}`)).payload.post.status, 'Vendido');
+  assert.equal((await sendDelivery(`/api/posts/${postId}`, ownerAuth, {}, 'DELETE')).response.status, 409);
+});
+
+test('clearing messages hides the inbox only for that user until a new message arrives', async () => {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  const headers = { 'Content-Type': 'application/json' };
+  const owner = await request('/api/auth/register', {
+    method: 'POST', headers,
+    body: JSON.stringify({ name: 'Dono das mensagens', email: `messages-owner-${suffix}@example.test`, password: 'senha-segura-123', city: 'Sao Paulo, SP' })
+  });
+  const viewer = await request('/api/auth/register', {
+    method: 'POST', headers,
+    body: JSON.stringify({ name: 'Leitor das mensagens', email: `messages-viewer-${suffix}@example.test`, password: 'senha-segura-123', city: 'Sao Paulo, SP' })
+  });
+  assert.equal(owner.response.status, 201);
+  assert.equal(viewer.response.status, 201);
+
+  const ownerAuth = { ...headers, Authorization: `Bearer ${owner.payload.token}` };
+  const viewerAuth = { ...headers, Authorization: `Bearer ${viewer.payload.token}` };
+  const post = await request('/api/posts', {
+    method: 'POST', headers: ownerAuth,
+    body: JSON.stringify({ ...requiredTransport, title: 'Cadeira para conversar', description: 'Item usado em teste de mensagens.', category: 'Móveis', condition: 'Bom estado', goal: 'Doação', location: 'Centro, Sao Paulo, SP', imageUrl: 'https://images.example.test/cadeira.jpg' })
+  });
+  assert.equal(post.response.status, 201);
+
+  const thread = await request('/api/messages/threads', {
+    method: 'POST', headers: viewerAuth, body: JSON.stringify({ postId: post.payload.post.id })
+  });
+  assert.equal(thread.response.status, 201);
+  const threadId = thread.payload.thread.id;
+
+  const firstMessage = await request(`/api/messages/threads/${threadId}/messages`, {
+    method: 'POST', headers: ownerAuth, body: JSON.stringify({ text: 'Olá, a cadeira ainda está disponível.' })
+  });
+  assert.equal(firstMessage.response.status, 201);
+
+  const beforeClear = await request('/api/messages/threads', { headers: viewerAuth });
+  assert.equal(beforeClear.payload.threads.length, 1);
+  const cleared = await request('/api/messages/threads', { method: 'DELETE', headers: viewerAuth });
+  assert.equal(cleared.response.status, 200);
+  assert.equal(cleared.payload.ok, true);
+
+  const viewerInbox = await request('/api/messages/threads', { headers: viewerAuth });
+  assert.deepEqual(viewerInbox.payload.threads, []);
+  const viewerThread = await request(`/api/messages/threads/${threadId}`, { headers: viewerAuth });
+  assert.deepEqual(viewerThread.payload.messages, []);
+
+  const ownerInbox = await request('/api/messages/threads', { headers: ownerAuth });
+  assert.ok(ownerInbox.payload.threads.some((item) => item.id === threadId));
+  const ownerThread = await request(`/api/messages/threads/${threadId}`, { headers: ownerAuth });
+  assert.equal(ownerThread.payload.messages.length, 1);
+
+  await new Promise((resolve) => setTimeout(resolve, 5));
+  const nextMessage = await request(`/api/messages/threads/${threadId}/messages`, {
+    method: 'POST', headers: ownerAuth, body: JSON.stringify({ text: 'Posso entregar amanhã.' })
+  });
+  assert.equal(nextMessage.response.status, 201);
+
+  const restoredInbox = await request('/api/messages/threads', { headers: viewerAuth });
+  assert.equal(restoredInbox.payload.threads.length, 1);
+  assert.equal(restoredInbox.payload.threads[0].id, threadId);
+  assert.equal(restoredInbox.payload.threads[0].subtitle, 'Posso entregar amanhã.');
+  const restoredThread = await request(`/api/messages/threads/${threadId}`, { headers: viewerAuth });
+  assert.deepEqual(restoredThread.payload.messages.map((message) => message.text), ['Posso entregar amanhã.']);
 });
 
 test('public listing location rejects exact residential addresses', async () => {
@@ -196,8 +558,101 @@ test('public listing location rejects exact residential addresses', async () => 
   const rejected = await request('/api/posts', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${registration.payload.token}` },
-    body: JSON.stringify({ title: 'Item protegido', description: 'Descrição válida.', category: 'Outros', location: 'Rua das Flores, 123', imageUrl: 'https://images.example.test/item.jpg' })
+    body: JSON.stringify({ ...requiredTransport, title: 'Item protegido', description: 'Descrição válida.', category: 'Outros', location: 'Rua das Flores, 123', imageUrl: 'https://images.example.test/item.jpg' })
   });
   assert.equal(rejected.response.status, 400);
   assert.match(rejected.payload.error, /exact address/i);
+});
+
+test('community campaigns track only confirmed deliveries and enforce permissions', async () => {
+  const loginAs = async email => (await request('/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ email, password: '12345678' }) })).payload.token;
+  const owner = await loginAs('mariana@reusa.com');
+  const donor = await loginAs('carlos@reusa.com');
+  const headers = token => ({ 'Content-Type': 'application/json', Authorization: `Bearer ${token}` });
+  const send = (url, token, body, method = 'POST') => request(url, { method, headers: headers(token), body: JSON.stringify(body) });
+  const body = { title: 'Cadeiras para o reforço escolar', beneficiary: 'Escola da comunidade', description: 'Precisamos de cadeiras em boas condições para abrir uma sala de reforço.', material: 'Cadeiras', target: 4, city: 'Santarém, PA', logistics: 'Podemos retirar na região central, mediante agendamento.', deadline: '2099-12-31' };
+  assert.equal((await request('/api/campaigns', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })).response.status, 401);
+  assert.equal((await send('/api/campaigns', owner, { ...body, target: 1.5 })).response.status, 400);
+  assert.equal((await send('/api/campaigns', owner, { ...body, deadline: '2099-02-30' })).response.status, 400);
+  assert.equal((await send('/api/campaigns', owner, { ...body, deadline: '2000-01-01' })).response.status, 400);
+  const created = await send('/api/campaigns', owner, body);
+  assert.equal(created.response.status, 201);
+  const id = created.payload.id;
+  const url = `/api/campaigns/${id}`;
+  const campaign = async () => (await request('/api/campaigns')).payload.campaigns.find(c => c.id === id);
+  assert.equal((await campaign()).remaining, 4);
+  const offer = { quantity: 2, note: 'Contato privado: combinar retirada na terça-feira.' };
+  assert.equal((await send(`${url}/contributions`, owner, offer)).response.status, 400);
+  assert.equal((await send(`${url}/contributions`, donor, { ...offer, quantity: 0 })).response.status, 400);
+  const pledged = await send(`${url}/contributions`, donor, offer);
+  assert.equal(pledged.response.status, 201);
+  assert.equal((await campaign()).received, 0);
+  assert.equal((await campaign()).pledged, 2);
+  assert.ok(!JSON.stringify((await request('/api/campaigns')).payload).includes(offer.note));
+  assert.equal((await request(`${url}/contributions`)).response.status, 401);
+  const registered = await request('/api/auth/register', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'Terceiro participante', email: 'campaign-private@example.test', password: 'senha-segura-123', city: 'Santarém, PA' }) });
+  assert.equal(registered.response.status, 201);
+  const stranger = registered.payload.token;
+  assert.equal((await request(`${url}/contributions`, { headers: headers(stranger) })).payload.contributions.length, 0);
+  const contributionUrl = `${url}/contributions/${pledged.payload.id}`;
+  const reply = 'Vamos combinar a retirada na escola na sexta-feira.';
+  assert.equal((await send(`${contributionUrl}/reply`, donor, { reply }, 'PATCH')).response.status, 403);
+  assert.equal((await send(`${contributionUrl}/reply`, owner, { reply }, 'PATCH')).response.status, 200);
+  assert.equal((await request(`${url}/contributions`, { headers: headers(donor) })).payload.contributions[0].reply, reply);
+  assert.ok(!JSON.stringify((await request('/api/campaigns')).payload).includes(reply));
+  const notices = (await request('/api/notifications', { headers: headers(owner) })).payload.notifications;
+  assert.ok(notices.some(n => n.title === 'Nova contribuição na campanha'));
+
+  assert.equal((await send(contributionUrl, donor, { status: 'received' }, 'PATCH')).response.status, 403);
+  assert.equal((await send(contributionUrl, stranger, { status: 'cancelled' }, 'PATCH')).response.status, 403);
+  const confirmations = await Promise.all([send(contributionUrl, owner, { status: 'received' }, 'PATCH'), send(contributionUrl, owner, { status: 'received' }, 'PATCH')]);
+  assert.deepEqual(confirmations.map(r => r.response.status), [200, 200]);
+  assert.equal((await campaign()).received, 2);
+  assert.equal((await campaign()).remaining, 2);
+  assert.equal((await send(contributionUrl, donor, { status: 'cancelled' }, 'PATCH')).response.status, 409);
+  const second = await send(`${url}/contributions`, donor, offer);
+  const secondUrl = `${url}/contributions/${second.payload.id}`;
+  assert.equal((await send(secondUrl, donor, { status: 'cancelled' }, 'PATCH')).response.status, 200);
+  assert.equal((await campaign()).pledged, 0);
+  assert.equal((await send(secondUrl, owner, { status: 'received' }, 'PATCH')).response.status, 409);
+  const last = await send(`${url}/contributions`, donor, offer);
+  assert.equal((await send(`${url}/contributions/${last.payload.id}`, owner, { status: 'received' }, 'PATCH')).response.status, 200);
+  assert.equal((await campaign()).received, 4);
+  assert.equal((await campaign()).accepting, false);
+  assert.equal((await send(`${url}/contributions`, donor, offer)).response.status, 409);
+  assert.equal((await send(`${url}/close`, donor, {}, 'PATCH')).response.status, 403);
+  assert.equal((await send(`${url}/close`, owner, {}, 'PATCH')).response.status, 200);
+  assert.equal((await campaign()).status, 'closed');
+  const SQL = await require('sql.js')();
+  const persisted = new SQL.Database(fs.readFileSync(path.join(dataDir, 'reusa.sqlite')));
+  try {
+    assert.equal(persisted.exec('SELECT status FROM campaigns WHERE id = ?', [id])[0].values[0][0], 'closed');
+    const events = persisted.exec('SELECT type FROM event_outbox WHERE payload_json LIKE ?', [`%${pledged.payload.id}%`])[0].values.flat();
+    assert.equal(events.filter(type => type === 'campaign.contribution_received').length, 1);
+    assert.ok(events.includes('campaign.contribution_pledged'));
+  } finally { persisted.close(); }
+
+  assert.equal((await send('/api/campaigns/missing/contributions', donor, offer)).response.status, 404);
+});
+
+test('seller cancels acceptance only before delivery or payment and can choose another bid', async () => {
+  await require('./acceptance-flow').exerciseAcceptanceFlow(request);
+});
+
+test('buyer cancels their own pending offer and can resend without stale requests cancelling the new offer', async () => {
+  await require('./offer-cancellation-flow').exerciseOfferCancellation(request);
+});
+
+test('clearing messages updates unread counts per user and ignores delayed notification events', async () => {
+  await require('./message-clear-flow').exerciseMessageClear(request, {
+    injectNotification: async notice => {
+      const notices = distributedNotifications.get(notice.userId) || [];
+      notices.push({ ...notice, readAt: null });
+      distributedNotifications.set(notice.userId, notices);
+    }
+  });
+});
+
+test('community tools protect alerts, coordinates, public questions, donation offers and reports',async()=>{
+ await require('./community-flow').exerciseCommunity(request);
 });

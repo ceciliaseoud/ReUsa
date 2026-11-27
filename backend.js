@@ -1,19 +1,28 @@
+const { registerStripeRoutes } = require('./storage/stripe-api');
+const { registerCommunityRoutes, postExtras } = require('./storage/community-api');
+const { registerDeliveryRoutes } = require('./storage/delivery-api');
+const { registerCampaignRoutes, campaignSchema } = require('./storage/campaign-api');
+
 const express = require('express');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const nodemailer = require('nodemailer');
 const initSqlJs = require('sql.js');
 const { EventPublisher } = require('./distributed/event-publisher');
 const { PostgresRepository, postgresEnabled, postgresConnectionString } = require('./storage/postgres-repository');
 const { registerPostgresRoutes } = require('./storage/postgres-api');
+const { createPostUpload } = require('./storage/post-media-upload');
+const { VIDEO_POSTER, mediaError, uploadedUrl, parseMediaOrder, orderedMedia, rejectRemoteVideos } = require('./storage/post-media');
 const { isLikelyResidentialAddress } = require('./storage/location-validation');
 const { buildCollectionPointAddress, geocodeCollectionPoint } = require('./storage/collection-point-geocoding');
 const { applyMigrations } = require('./scripts/run-postgres-migrations');
 const { createObjectStorage } = require('./distributed/object-storage');
 const { connectRedis } = require('./distributed/redis-client');
 const { metricsText, requestMetrics } = require('./distributed/observability');
+const stripe = require('./services/stripe-payments');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -22,12 +31,25 @@ const JWT_SECRET = process.env.JWT_SECRET || crypto.randomBytes(32).toString('he
 const GOOGLE_CLIENT_ID = String(process.env.GOOGLE_CLIENT_ID || '').trim();
 const GOOGLE_CLIENT_SECRET = String(process.env.GOOGLE_CLIENT_SECRET || '').trim();
 const GOOGLE_REDIRECT_URI = String(process.env.GOOGLE_REDIRECT_URI || '').trim();
-const ADMIN_EMAIL = String(process.env.ADMIN_EMAIL || '').trim().toLowerCase();
+const ADMIN_EMAILS = new Set(
+  [process.env.ADMIN_EMAIL, process.env.ADMIN_EMAILS]
+    .flatMap((value) => String(value || '').split(/[,;\s]+/))
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean)
+);
+const SQLITE_ADMIN_EMAILS = ADMIN_EMAILS.size ? ADMIN_EMAILS : new Set(['mariana@reusa.com']);
 const APP_BASE_URL = String(process.env.APP_BASE_URL || '').trim().replace(/\/$/, '');
 const NOTIFICATION_SERVICE_URL = String(process.env.NOTIFICATION_SERVICE_URL || '').trim().replace(/\/$/, '');
 const IMPACT_SERVICE_URL = String(process.env.IMPACT_SERVICE_URL || '').trim().replace(/\/$/, '');
 const SERVICE_AUTH_TOKEN = String(process.env.SERVICE_AUTH_TOKEN || '').trim();
+const SMTP_HOST = String(process.env.SMTP_HOST || '').trim();
+const SMTP_PORT = Number(process.env.SMTP_PORT || 587);
+const SMTP_USER = String(process.env.SMTP_USER || '').trim();
+const SMTP_PASSWORD = String(process.env.SMTP_PASSWORD || '').trim();
+const EMAIL_FROM = String(process.env.EMAIL_FROM || SMTP_USER).trim();
 const INSTANCE_ID = String(process.env.INSTANCE_ID || `core-${crypto.randomUUID()}`).slice(0, 120);
+const DEFAULT_ROUTING_BASE_URL = 'https://router.project-osrm.org';
+const ROUTING_BASE_URL = validatedRoutingBaseUrl(process.env.ROUTING_BASE_URL || DEFAULT_ROUTING_BASE_URL);
 const ROOT = __dirname;
 // Railway exposes the path of an attached Volume through this variable.
 // Without a Volume, development continues to use the local data folder.
@@ -42,6 +64,13 @@ const IMAGE_EXTENSIONS = new Map([
   ['image/webp', '.webp'],
   ['image/avif', '.avif']
 ]);
+const DONATION_GOAL = 'Doa\u00e7\u00e3o';
+const SALE_GOAL = 'Venda';
+const POST_GOALS = new Set([DONATION_GOAL, 'Troca', SALE_GOAL]);
+
+function isConfiguredAdminEmail(email) {
+  return ADMIN_EMAILS.has(String(email || '').trim().toLowerCase());
+}
 
 let db;
 let postgres;
@@ -61,6 +90,89 @@ function cachedExternalValue(key) {
 function cacheExternalValue(key, value, ttlMs) {
   externalCache.set(key, { value, expiresAt: Date.now() + ttlMs });
   return value;
+}
+
+function validatedRoutingBaseUrl(value) {
+  const raw = String(value || '').trim().replace(/\/+$/, '');
+  let url;
+  try {
+    url = new URL(raw);
+  } catch {
+    throw new Error('ROUTING_BASE_URL must be an absolute URL');
+  }
+
+  const isLocalDevelopmentHost = ['localhost', '127.0.0.1', '::1'].includes(url.hostname);
+  const allowsHttpForLocalDevelopment = process.env.NODE_ENV !== 'production' && isLocalDevelopmentHost;
+  if (url.protocol !== 'https:' && !(url.protocol === 'http:' && allowsHttpForLocalDevelopment)) {
+    throw new Error('ROUTING_BASE_URL must use HTTPS (HTTP is allowed only for local development)');
+  }
+  if (url.username || url.password) {
+    throw new Error('ROUTING_BASE_URL must not include credentials');
+  }
+
+  url.hash = '';
+  url.search = '';
+  return url.toString().replace(/\/$/, '');
+}
+
+function routeCoordinate(value, min, max) {
+  if (Array.isArray(value)) return null;
+  const raw = String(value ?? '').trim();
+  if (!raw || raw.length > 32 || !/^-?(?:\d+|\d*\.\d+)$/.test(raw)) return null;
+  const coordinate = Number(raw);
+  return Number.isFinite(coordinate) && coordinate >= min && coordinate <= max ? coordinate : null;
+}
+
+function routeCoordinatesAreValid(coordinates) {
+  return Array.isArray(coordinates)
+    && coordinates.length >= 2
+    && coordinates.length <= 20_000
+    && coordinates.every((coordinate) => Array.isArray(coordinate)
+      && coordinate.length >= 2
+      && typeof coordinate[0] === 'number'
+      && typeof coordinate[1] === 'number'
+      && Number.isFinite(coordinate[0])
+      && Number.isFinite(coordinate[1])
+      && coordinate[0] >= -180
+      && coordinate[0] <= 180
+      && coordinate[1] >= -90
+      && coordinate[1] <= 90);
+}
+
+function sanitizedRoute(route) {
+  const coordinates = route?.geometry?.coordinates;
+  const distance = Number(route?.distance);
+  const duration = Number(route?.duration);
+  if (route?.geometry?.type !== 'LineString'
+    || !routeCoordinatesAreValid(coordinates)
+    || !Number.isFinite(distance)
+    || !Number.isFinite(duration)
+    || distance < 0
+    || duration < 0
+    || distance > 50_000_000
+    || duration > 7 * 24 * 60 * 60) {
+    return null;
+  }
+
+  return {
+    geometry: {
+      type: 'LineString',
+      coordinates: coordinates.map(([longitude, latitude]) => [
+        Number(Number(longitude).toFixed(6)),
+        Number(Number(latitude).toFixed(6))
+      ])
+    },
+    distance: Math.round(distance),
+    duration: Math.round(duration)
+  };
+}
+
+function osrmRouteUrl({ fromLat, fromLng, toLat, toLng }) {
+  const url = new URL(ROUTING_BASE_URL);
+  const basePath = url.pathname.replace(/\/$/, '');
+  url.pathname = `${basePath}/route/v1/driving/${fromLng.toFixed(6)},${fromLat.toFixed(6)};${toLng.toFixed(6)},${toLat.toFixed(6)}`;
+  url.search = new URLSearchParams({ overview: 'full', geometries: 'geojson', alternatives: 'false', steps: 'false' }).toString();
+  return url;
 }
 
 app.disable('x-powered-by');
@@ -115,6 +227,56 @@ function verifyPassword(password, storedHash) {
 
 function uid(prefix) {
   return `${prefix}-${crypto.randomUUID()}`;
+}
+
+function parseMoneyToCents(value) {
+  if (typeof value === 'number') {
+    return Number.isSafeInteger(value) ? value : Math.round(value * 100);
+  }
+  const normalized = String(value ?? '').trim().replace(/^R\$\s*/i, '');
+  if (!normalized) return null;
+  const brazilian = normalized.replace(/\./g, '').replace(',', '.');
+  if (!/^\d+(?:\.\d{1,2})?$/.test(brazilian)) return null;
+  const amount = Number(brazilian);
+  if (!Number.isFinite(amount)) return null;
+  return Math.round(amount * 100);
+}
+
+function formatMoney(cents) {
+  return (Number(cents) / 100).toLocaleString('pt-BR', { style: 'currency', currency: 'BRL' });
+}
+
+function postImages(postId, fallbackImage) {
+  const images = all('SELECT image_url FROM post_images WHERE post_id = ? ORDER BY sort_order, created_at', [postId]).map((item) => item.image_url);
+  return images.length ? images : (fallbackImage && fallbackImage !== VIDEO_POSTER ? [fallbackImage] : []);
+}
+
+function postVideos(postId) {
+  return all('SELECT video_url, mime_type FROM post_videos WHERE post_id = ? ORDER BY sort_order, created_at', [postId])
+    .map((video) => ({ url: video.video_url, mimeType: video.mime_type }));
+}
+
+function postMedia(post, body, files = {}) {
+  rejectRemoteVideos(body);
+  const images = orderedMedia(
+    postImages(post.id, post.image_url).map((url) => ({ url })),
+    (files.images || []).map((file) => ({ url: uploadedUrl(file) })),
+    parseMediaOrder(body?.imageOrder, 'fotos'), 8, 'fotos'
+  );
+  const videos = orderedMedia(
+    postVideos(post.id),
+    (files.videos || []).map((file) => ({ url: uploadedUrl(file), mimeType: file.mimetype })),
+    parseMediaOrder(body?.videoOrder, 'vídeos'), 2, 'vídeos'
+  );
+  if (!images.length && !videos.length) throw mediaError('Adicione pelo menos uma foto ou um vídeo do item.');
+  return { images, videos, cover: images[0]?.url || VIDEO_POSTER };
+}
+
+function savePostMedia(postId, media, createdAt) {
+  run('DELETE FROM post_images WHERE post_id = ?', [postId]);
+  media.images.forEach((image, index) => run('INSERT INTO post_images (id, post_id, image_url, sort_order, created_at) VALUES (?, ?, ?, ?, ?)', [uid('post-image'), postId, image.url, index, createdAt]));
+  run('DELETE FROM post_videos WHERE post_id = ?', [postId]);
+  media.videos.forEach((video, index) => run('INSERT INTO post_videos (id, post_id, video_url, mime_type, sort_order, created_at) VALUES (?, ?, ?, ?, ?, ?)', [uid('post-video'), postId, video.url, video.mimeType, index, createdAt]));
 }
 
 function googleOauthEnabled() {
@@ -265,7 +427,7 @@ async function userForGoogleProfile(profile) {
           user = (await client.query(
             `INSERT INTO users (id, name, email, password_hash, city, neighborhood, cep, address, interests_json, avatar, achievements_json, role, created_at, last_active_at)
              VALUES ($1, $2, $3, $4, $5, '', '', '', '[]', $6, '["Novo membro"]', $7, now(), now()) RETURNING *`,
-            [userId, profile.name, profile.email, passwordHash(crypto.randomBytes(32).toString('hex')), 'Não informado', profile.avatar, profile.email === ADMIN_EMAIL ? 'admin' : 'user']
+            [userId, profile.name, profile.email, passwordHash(crypto.randomBytes(32).toString('hex')), 'Não informado', profile.avatar, isConfiguredAdminEmail(profile.email) ? 'admin' : 'user']
           )).rows[0];
         }
         await client.query(
@@ -277,7 +439,7 @@ async function userForGoogleProfile(profile) {
       if (!user.avatar && profile.avatar) {
         user = (await client.query('UPDATE users SET avatar = $1 WHERE id = $2 RETURNING *', [profile.avatar, user.id])).rows[0];
       }
-      if (ADMIN_EMAIL && String(user.email).toLowerCase() === ADMIN_EMAIL && user.role !== 'admin') {
+      if (isConfiguredAdminEmail(user.email) && user.role !== 'admin') {
         user = (await client.query("UPDATE users SET role = 'admin' WHERE id = $1 RETURNING *", [user.id])).rows[0];
       }
       return user;
@@ -297,9 +459,9 @@ async function userForGoogleProfile(profile) {
     } else {
       const userId = uid('user');
       run(
-        `INSERT INTO users (id, name, email, password_hash, city, cep, address, interests_json, avatar, rating, donations, received, carbon_saved_percent, achievements_json, created_at, last_active_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [userId, profile.name, profile.email, passwordHash(crypto.randomBytes(32).toString('hex')), 'Não informado', '', '', '[]', profile.avatar, 0, 0, 0, 0, '["Novo membro"]', new Date().toISOString(), new Date().toISOString()]
+        `INSERT INTO users (id, name, email, password_hash, city, cep, address, interests_json, avatar, rating, donations, received, carbon_saved_percent, achievements_json, role, created_at, last_active_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [userId, profile.name, profile.email, passwordHash(crypto.randomBytes(32).toString('hex')), 'Não informado', '', '', '[]', profile.avatar, 0, 0, 0, 0, '["Novo membro"]', isConfiguredAdminEmail(profile.email) ? 'admin' : 'user', new Date().toISOString(), new Date().toISOString()]
       );
       user = get('SELECT * FROM users WHERE id = ?', [userId]);
     }
@@ -312,6 +474,10 @@ async function userForGoogleProfile(profile) {
 
   if (!user.avatar && profile.avatar) {
     run('UPDATE users SET avatar = ? WHERE id = ?', [profile.avatar, user.id]);
+    user = get('SELECT * FROM users WHERE id = ?', [user.id]);
+  }
+  if (isConfiguredAdminEmail(user.email) && user.role !== 'admin') {
+    run("UPDATE users SET role = 'admin' WHERE id = ?", [user.id]);
     user = get('SELECT * FROM users WHERE id = ?', [user.id]);
   }
   return user;
@@ -393,6 +559,7 @@ function userFromRow(row) {
     id: row.id,
     name: row.name,
     email: row.email,
+    emailVerified: row.email_verified !== false && row.email_verified !== 0,
     city: row.city,
     neighborhood: row.neighborhood || '',
     cep: row.cep || '',
@@ -410,7 +577,61 @@ function userFromRow(row) {
     role: row.role || 'user',
     suspended: Boolean(row.suspended),
     notificationPreferences: jsonArray(row.notification_preferences_json)
+    , stripeConnected: Boolean(row.stripe_account_id),
+    stripeDemoMode: stripe.demoEnabled(),
+    stripeTestMode: stripe.isTestEnvironment(),
+    stripePixEnabled: stripe.configured() && process.env.STRIPE_PIX_ENABLED === 'true'
   };
+}
+
+
+function verificationToken() {
+  const raw = crypto.randomBytes(32).toString('hex');
+  return { raw, hash: sha256(raw), expiresAt: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString() };
+}
+
+async function sendVerificationEmail(email, name, token, requestOrigin = '') {
+  const baseUrl = APP_BASE_URL || requestOrigin || `http://localhost:${PORT}`;
+  const verificationUrl = `${baseUrl}/api/auth/verify-email?token=${encodeURIComponent(token)}`;
+  return sendSmtpEmail({
+    email,
+    subject: 'Confirme seu e-mail no ReUsa+',
+    text: `Olá, ${name}!\n\nConfirme seu e-mail para ativar sua conta: ${verificationUrl}\n\nEste link expira em 24 horas.`,
+    html: `<p>Olá, ${String(name).replace(/[<>&]/g, '')}!</p><p>Confirme seu e-mail para ativar sua conta:</p><p><a href="${verificationUrl}">Confirmar meu e-mail</a></p><p>Este link expira em 24 horas.</p>`
+  });
+}
+
+async function sendPasswordResetEmail(email, name, token, requestOrigin = '') {
+  const baseUrl = APP_BASE_URL || requestOrigin || `http://localhost:${PORT}`;
+  const resetUrl = `${baseUrl}/redefinir-senha?token=${encodeURIComponent(token)}`;
+  return sendSmtpEmail({
+    email,
+    subject: 'Redefina sua senha no ReUsa+',
+    text: `Olá, ${name}!\n\nRedefina sua senha pelo link: ${resetUrl}\n\nEste link expira em 1 hora.`,
+    html: `<p>Olá, ${String(name).replace(/[<>&]/g, '')}!</p><p>Recebemos uma solicitação para redefinir sua senha.</p><p><a href="${resetUrl}">Redefinir minha senha</a></p><p>Este link expira em 1 hora. Se você não solicitou a alteração, ignore este e-mail.</p>`
+  });
+}
+
+async function sendSmtpEmail({ email, subject, text, html }) {
+  if (!SMTP_HOST || !SMTP_USER || !SMTP_PASSWORD || !EMAIL_FROM) {
+    if (process.env.NODE_ENV === 'production') throw new Error('Email delivery is not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASSWORD and EMAIL_FROM.');
+    console.warn(`[email] Email delivery is not configured for ${email}`);
+    return { delivered: false };
+  }
+  const transporter = nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: SMTP_PORT,
+    secure: SMTP_PORT === 465,
+    auth: { user: SMTP_USER, pass: SMTP_PASSWORD }
+  });
+  await transporter.sendMail({
+    from: EMAIL_FROM,
+    to: email,
+    subject,
+    text,
+    html
+  });
+  return { delivered: true };
 }
 
 function safeAvatar(value) {
@@ -429,21 +650,21 @@ function adminMiddleware(req, res, next) {
   return next();
 }
 
-function notification(userId, type, title, text, link = '') {
+function notification(userId, type, title, text, link = '', createdAt = new Date().toISOString()) {
   run(
     'INSERT INTO notifications (id, user_id, type, title, text, created_at, link) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [uid('notification'), userId, type, title, text, new Date().toISOString(), link]
+    [uid('notification'), userId, type, title, text, createdAt, link]
   );
 }
 
 // Transactional outbox: the business change and its event are persisted in the
 // same local database before any network call is attempted. This gives us
 // at-least-once delivery even when RabbitMQ is temporarily unavailable.
-function emitDomainEvent(type, data, correlationId = 'system') {
+function emitDomainEvent(type, data, correlationId = 'system', occurredAt = new Date().toISOString()) {
   const event = {
     id: uid('event'),
     type,
-    occurredAt: new Date().toISOString(),
+    occurredAt,
     correlationId,
     data
   };
@@ -524,10 +745,12 @@ async function flushPendingEvents() {
 function publicPost(row, viewerId = null) {
   const author = get('SELECT id, name, city, neighborhood, account_type, business_name, avatar FROM users WHERE id = ?', [row.author_id]);
   const interestCount = get("SELECT COUNT(*) AS count FROM negotiations WHERE post_id = ? AND status IN ('interested', 'reserved', 'completed')", [row.id])?.count || 0;
+  const viewerNegotiation = viewerId ? get('SELECT status, proposal_status, proposal_amount_cents, proposal_method FROM negotiations WHERE post_id = ? AND interested_id = ? ORDER BY updated_at DESC LIMIT 1', [row.id, viewerId]) : null;
   const saved = viewerId ? Boolean(get('SELECT post_id FROM favorites WHERE user_id = ? AND post_id = ?', [viewerId, row.id])) : false;
   const liked = viewerId ? Boolean(get('SELECT post_id FROM post_likes WHERE user_id = ? AND post_id = ?', [viewerId, row.id])) : false;
   const reputation = author ? get('SELECT ROUND(AVG(rating), 1) AS average, COUNT(*) AS count FROM reviews WHERE reviewee_id = ?', [author.id]) : null;
   return {
+    transport: JSON.parse(row.transport_json || '{}'), hasApproximateLocation: row.area_lat != null && row.area_lng != null,
     id: row.id,
     authorId: row.author_id,
     author: author ? { id: author.id, name: author.name, city: author.city, neighborhood: author.neighborhood || '', accountType: author.account_type || 'person', businessName: author.business_name || '', avatar: safeAvatar(author.avatar) } : null,
@@ -537,6 +760,8 @@ function publicPost(row, viewerId = null) {
     condition: row.condition,
     goal: row.goal,
     imageUrl: row.image_url,
+    imageUrls: postImages(row.id, row.image_url),
+    videos: postVideos(row.id),
     likes: row.likes,
     comments: row.comments,
     location: approximateLocation(row.location),
@@ -546,6 +771,9 @@ function publicPost(row, viewerId = null) {
     status: row.status || 'Disponível',
     views: Number(row.views || 0),
     interestedCount: Number(interestCount),
+    offerStatus: viewerNegotiation?.proposal_status || 'none',
+    offerAmountCents: viewerNegotiation?.proposal_amount_cents || null,
+    offerMethod: viewerNegotiation?.proposal_method || null,
     saved,
     liked,
     updatedAt: row.updated_at || row.created_at,
@@ -554,20 +782,61 @@ function publicPost(row, viewerId = null) {
   };
 }
 
-function threadSummary(row, currentUserId) {
+
+function messageNoticeLink(threadId) {
+  return `/mensagens/ana?thread=${encodeURIComponent(threadId)}`;
+}
+
+function applyMessageClearState(notifications, userId) {
+  const clears = new Map(all('SELECT thread_id, cleared_at FROM message_clears WHERE user_id = ?', [userId])
+    .map((clear) => [messageNoticeLink(clear.thread_id), clear.cleared_at]));
+  return notifications.map((notice) => {
+    const clearedAt = notice.type === 'message' && clears.get(notice.link);
+    return !notice.readAt && clearedAt && Date.parse(notice.createdAt) <= Date.parse(clearedAt)
+      ? { ...notice, readAt: clearedAt } : notice;
+  });
+}
+
+async function notificationsForUser(userId, { limit = 50 } = {}) {
+  const local = all(`SELECT id, type, title, text, link, created_at AS createdAt, read_at AS readAt FROM notifications WHERE user_id = ? ORDER BY created_at DESC${limit ? ' LIMIT ' + limit : ''}`, [userId]);
+  const distributed = await distributedServiceValue(NOTIFICATION_SERVICE_URL, `/notifications/${encodeURIComponent(userId)}`);
+  const remote = (distributed?.notifications || []).map((item) => ({ ...item, createdAt: item.createdAt || item.created_at, readAt: item.readAt || item.read_at || null }));
+  const notifications = applyMessageClearState([...local, ...remote], userId)
+    .sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+  return limit ? notifications.slice(0, limit) : notifications;
+}
+
+function markClearedMessageNoticesRead(userId, threadId, clearedAt) {
+  run("UPDATE notifications SET read_at = ? WHERE user_id = ? AND type = 'message' AND link = ? AND read_at IS NULL AND created_at <= ?", [clearedAt, userId, messageNoticeLink(threadId), clearedAt]);
+}
+
+function messageClearTimestamp(userId, threads) {
+  const previous = get('SELECT MAX(cleared_at) AS cleared_at FROM message_clears WHERE user_id = ?', [userId]);
+  return new Date(Math.max(Date.now(), Date.parse(previous?.cleared_at || '') || 0,
+    ...threads.map((thread) => Date.parse(thread.last_message_at || '') || 0))).toISOString();
+}
+
+function threadSummary(row, currentUserId, { hideCleared = false, notifications } = {}) {
   const participants = JSON.parse(row.participants_json || '[]');
   const otherParticipantId = participants.find((participantId) => participantId !== currentUserId) || participants[0];
   const otherUser = otherParticipantId ? get('SELECT id, name, avatar FROM users WHERE id = ?', [otherParticipantId]) : null;
-  const lastMessage = get('SELECT text, sent_at FROM messages WHERE thread_id = ? ORDER BY sent_at DESC LIMIT 1', [row.id]);
+  const clear = get('SELECT cleared_at FROM message_clears WHERE user_id = ? AND thread_id = ?', [currentUserId, row.id]);
+  const lastMessage = clear
+    ? get('SELECT text, sent_at FROM messages WHERE thread_id = ? AND sent_at > ? ORDER BY sent_at DESC LIMIT 1', [row.id, clear.cleared_at])
+    : get('SELECT text, sent_at FROM messages WHERE thread_id = ? ORDER BY sent_at DESC LIMIT 1', [row.id]);
   const post = get('SELECT title FROM posts WHERE id = ?', [row.post_id]);
+
+  if (hideCleared && clear && !lastMessage) return null;
 
   return {
     id: row.id,
     threadId: row.id,
-    unreadCount: row.unread_count,
+    unreadCount: notifications
+      ? notifications.filter((notice) => notice.type === 'message' && !notice.readAt && notice.link === messageNoticeLink(row.id)).length
+      : Number(get("SELECT COUNT(*) AS count FROM notifications WHERE user_id = ? AND type = 'message' AND link = ? AND read_at IS NULL AND (? IS NULL OR created_at > ?)", [currentUserId, messageNoticeLink(row.id), clear?.cleared_at || null, clear?.cleared_at || null])?.count || 0),
     title: otherUser ? otherUser.name : 'Conversa',
     subtitle: lastMessage ? lastMessage.text : post ? post.title : 'Sem mensagens',
-    time: lastMessage ? new Date(lastMessage.sent_at).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' }) : '',
+    time: lastMessage ? lastMessage.sent_at : '',
     avatar: otherUser ? otherUser.avatar : null,
     route: '/mensagens/ana'
   };
@@ -628,10 +897,44 @@ function seedDatabase() {
       role TEXT NOT NULL DEFAULT 'user',
       suspended INTEGER NOT NULL DEFAULT 0,
       notification_preferences_json TEXT NOT NULL DEFAULT '[]',
+      email_verified INTEGER NOT NULL DEFAULT 1,
+      email_verification_token_hash TEXT,
+      email_verification_expires_at TEXT,
       created_at TEXT
     );
   `);
-
+  run(`
+    CREATE TABLE IF NOT EXISTS message_clears (
+      user_id TEXT NOT NULL,
+      thread_id TEXT NOT NULL,
+      cleared_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, thread_id),
+      FOREIGN KEY(user_id) REFERENCES users(id),
+      FOREIGN KEY(thread_id) REFERENCES threads(id)
+    );
+  `);
+  run(`
+    CREATE TABLE IF NOT EXISTS post_images (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      image_url TEXT NOT NULL,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(post_id) REFERENCES posts(id)
+    );
+  `);
+  run(`
+    CREATE TABLE IF NOT EXISTS post_videos (
+      id TEXT PRIMARY KEY,
+      post_id TEXT NOT NULL,
+      video_url TEXT NOT NULL,
+      mime_type TEXT NOT NULL CHECK (mime_type IN ('video/mp4', 'video/webm')),
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(post_id) REFERENCES posts(id) ON DELETE CASCADE
+    );
+  `);
+  run('CREATE INDEX IF NOT EXISTS post_videos_post_order_idx ON post_videos(post_id, sort_order)');
   const userColumns = new Set(all('PRAGMA table_info(users)').map((column) => column.name));
   ['neighborhood', 'cep', 'address', 'account_type', 'business_name', 'cnpj'].forEach((column) => {
     if (!userColumns.has(column)) {
@@ -664,7 +967,6 @@ function seedDatabase() {
       FOREIGN KEY(author_id) REFERENCES users(id)
     );
   `);
-
   run(`
     CREATE TABLE IF NOT EXISTS threads (
       id TEXT PRIMARY KEY,
@@ -794,6 +1096,73 @@ function seedDatabase() {
       FOREIGN KEY(interested_id) REFERENCES users(id)
     );
   `);
+  ensureColumn('negotiations', 'proposal_status', "TEXT NOT NULL DEFAULT 'none'");
+  ensureColumn('negotiations', 'proposal_amount_cents', 'INTEGER');
+  ensureColumn('negotiations', 'proposal_method', "TEXT");
+  ensureColumn('negotiations', 'proposal_created_at', 'TEXT');
+
+  run(`
+    CREATE TABLE IF NOT EXISTS collection_deliveries (
+      id TEXT PRIMARY KEY,
+      negotiation_id TEXT NOT NULL UNIQUE,
+      mode TEXT NOT NULL,
+      scheduled_for TEXT NOT NULL,
+      address TEXT NOT NULL DEFAULT '',
+      collection_point_id TEXT,
+      status TEXT NOT NULL DEFAULT 'scheduled',
+      confirmation_token_hash TEXT NOT NULL,
+      confirmation_token_expires_at TEXT NOT NULL,
+      qr_code_data_url TEXT NOT NULL DEFAULT '',
+      confirmed_at TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      FOREIGN KEY(negotiation_id) REFERENCES negotiations(id),
+      FOREIGN KEY(collection_point_id) REFERENCES collection_points(id)
+    );
+  `);
+  run('CREATE INDEX IF NOT EXISTS collection_deliveries_status_idx ON collection_deliveries(status, scheduled_for)');
+  for (const statement of fs.readFileSync(path.join(ROOT, 'migrations/014_negotiation_followup.sql'), 'utf8').split(';').filter(part => part.trim())) run(statement);
+  for (const column of ['proposed_by', 'accepted_by', 'accepted_at', 'received_at', 'payment_attempt_key']) ensureColumn('collection_deliveries', column, 'TEXT');
+  ensureColumn('collection_deliveries', 'payment_locked', 'INTEGER NOT NULL DEFAULT 0');
+  run("UPDATE collection_deliveries SET status='cancelled' WHERE proposed_by IS NULL AND status IN ('scheduled','confirmed','in_transit')");
+
+  run(`
+    CREATE TABLE IF NOT EXISTS payments (
+      id TEXT PRIMARY KEY,
+      negotiation_id TEXT NOT NULL,
+      payer_id TEXT NOT NULL,
+      payee_id TEXT NOT NULL,
+      amount_cents INTEGER NOT NULL,
+      currency TEXT NOT NULL DEFAULT 'BRL',
+      method TEXT NOT NULL,
+      status TEXT NOT NULL,
+      idempotency_key TEXT NOT NULL,
+      provider_reference TEXT NOT NULL,
+      failure_code TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      paid_at TEXT,
+      refunded_at TEXT,
+      UNIQUE(negotiation_id, idempotency_key),
+      FOREIGN KEY(negotiation_id) REFERENCES negotiations(id),
+      FOREIGN KEY(payer_id) REFERENCES users(id),
+      FOREIGN KEY(payee_id) REFERENCES users(id)
+    );
+  `);
+  ensureColumn('payments', 'checkout_url', 'TEXT');
+
+  run(`
+    CREATE TABLE IF NOT EXISTS payment_audit_events (
+      id TEXT PRIMARY KEY,
+      payment_id TEXT NOT NULL,
+      from_status TEXT,
+      to_status TEXT NOT NULL,
+      reason TEXT NOT NULL,
+      correlation_id TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      FOREIGN KEY(payment_id) REFERENCES payments(id)
+    );
+  `);
 
   run(`
     CREATE TABLE IF NOT EXISTS reviews (
@@ -885,8 +1254,14 @@ function seedDatabase() {
   ensureColumn('users', 'role', "TEXT NOT NULL DEFAULT 'user'");
   ensureColumn('users', 'suspended', 'INTEGER NOT NULL DEFAULT 0');
   ensureColumn('users', 'notification_preferences_json', "TEXT NOT NULL DEFAULT '[]'");
+  ensureColumn('users', 'stripe_account_id', 'TEXT');
   ensureColumn('users', 'last_active_at', 'TEXT');
   ensureColumn('users', 'created_at', 'TEXT');
+  ensureColumn('users', 'email_verified', 'INTEGER NOT NULL DEFAULT 1');
+  ensureColumn('users', 'email_verification_token_hash', 'TEXT');
+  ensureColumn('users', 'email_verification_expires_at', 'TEXT');
+  ensureColumn('users', 'password_reset_token_hash', 'TEXT');
+  ensureColumn('users', 'password_reset_expires_at', 'TEXT');
   ensureColumn('posts', 'status', "TEXT NOT NULL DEFAULT 'Disponível'");
   ensureColumn('posts', 'reserved_by', 'TEXT');
   ensureColumn('posts', 'completed_with', 'TEXT');
@@ -904,9 +1279,11 @@ function seedDatabase() {
   run(`UPDATE users SET avatar = '' WHERE id = 'user-ana'`);
   run('UPDATE users SET created_at = COALESCE(created_at, ?)', [new Date().toISOString()]);
 
-  const adminEmail = ADMIN_EMAIL || 'mariana@reusa.com';
-  if (adminEmail) {
-    run('UPDATE users SET role = ? WHERE lower(email) = lower(?)', ['admin', adminEmail]);
+  run('DELETE FROM messages WHERE thread_id = ?', ['thread-ana-notebook']);
+  run('DELETE FROM threads WHERE id = ?', ['thread-ana-notebook']);
+
+  for (const adminEmail of SQLITE_ADMIN_EMAILS) {
+    run('UPDATE users SET role = ? WHERE lower(email) = lower(?) AND email_verified <> 0', ['admin', adminEmail]);
   }
 
   const userCount = get('SELECT COUNT(*) AS count FROM users')?.count || 0;
@@ -960,7 +1337,7 @@ function seedDatabase() {
 
   seedUsers.forEach((user) => {
     run(
-      `INSERT INTO users (id, name, email, password_hash, city, cep, address, interests_json, avatar, rating, donations, received, carbon_saved_percent, achievements_json)
+      `INSERT OR IGNORE INTO users (id, name, email, password_hash, city, cep, address, interests_json, avatar, rating, donations, received, carbon_saved_percent, achievements_json)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         user.id,
@@ -1018,7 +1395,7 @@ function seedDatabase() {
 
   seedPosts.forEach((post) => {
     run(
-      `INSERT INTO posts (id, author_id, title, description, category, condition, goal, image_url, likes, comments, location, created_at, chip_icon, chip_label)
+      `INSERT OR IGNORE INTO posts (id, author_id, title, description, category, condition, goal, image_url, likes, comments, location, created_at, chip_icon, chip_label)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
         post.id,
@@ -1041,18 +1418,6 @@ function seedDatabase() {
 
   const seedThreads = [
     {
-      id: 'thread-ana-notebook',
-      postId: 'post-ana-notebook',
-      participants: ['user-mariana', 'user-ana'],
-      unreadCount: 2,
-      lastMessageAt: '2026-08-26T10:45:00.000Z',
-      messages: [
-        { id: 'msg-1', senderId: 'user-mariana', text: 'Olá! Tenho interesse nesse aparelho. Ainda está disponível?', sentAt: '2026-08-26T10:42:00.000Z', status: 'read' },
-        { id: 'msg-2', senderId: 'user-ana', text: 'Sim, ainda está disponível.', sentAt: '2026-08-26T10:45:00.000Z', status: 'read' },
-        { id: 'msg-3', senderId: 'user-ana', text: 'Pode retirar comigo em um ponto público?', sentAt: '2026-08-26T10:45:00.000Z', status: 'read' }
-      ]
-    },
-    {
       id: 'thread-carlos-chair',
       postId: 'post-carlos-chair',
       participants: ['user-mariana', 'user-carlos'],
@@ -1067,14 +1432,14 @@ function seedDatabase() {
 
   seedThreads.forEach((thread) => {
     run(
-      `INSERT INTO threads (id, post_id, participants_json, unread_count, last_message_at)
+      `INSERT OR IGNORE INTO threads (id, post_id, participants_json, unread_count, last_message_at)
        VALUES (?, ?, ?, ?, ?)`,
       [thread.id, thread.postId, JSON.stringify(thread.participants), thread.unreadCount, thread.lastMessageAt]
     );
 
     thread.messages.forEach((message) => {
       run(
-        `INSERT INTO messages (id, thread_id, sender_id, text, sent_at, status)
+        `INSERT OR IGNORE INTO messages (id, thread_id, sender_id, text, sent_at, status)
          VALUES (?, ?, ?, ?, ?, ?)`,
         [message.id, thread.id, message.senderId, message.text, message.sentAt, message.status]
       );
@@ -1088,14 +1453,14 @@ function seedDatabase() {
 
   seedPoints.forEach((point) => {
     run(
-      `INSERT INTO collection_points (id, name, categories_json, hours, location, status)
+      `INSERT OR IGNORE INTO collection_points (id, name, categories_json, hours, location, status)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [point.id, point.name, JSON.stringify(point.categories), point.hours, point.location, point.status]
     );
   });
 
-  if (adminEmail) {
-    run('UPDATE users SET role = ? WHERE lower(email) = lower(?)', ['admin', adminEmail]);
+  for (const adminEmail of SQLITE_ADMIN_EMAILS) {
+    run('UPDATE users SET role = ? WHERE lower(email) = lower(?) AND email_verified <> 0', ['admin', adminEmail]);
   }
 
   persistDb();
@@ -1226,8 +1591,8 @@ async function start() {
     } finally {
       migrationClient.release();
     }
-    if (ADMIN_EMAIL) {
-      await postgres.query("UPDATE users SET role = 'admin' WHERE lower(email) = lower($1)", [ADMIN_EMAIL]);
+    for (const adminEmail of ADMIN_EMAILS) {
+      await postgres.query("UPDATE users SET role = 'admin' WHERE lower(email) = lower($1) AND email_verified = true", [adminEmail]);
     }
     console.log('[database] PostgreSQL is the only runtime source of truth');
   } else {
@@ -1237,6 +1602,20 @@ async function start() {
     const bytes = loadDbBytes();
     db = bytes ? new SQL.Database(bytes) : new SQL.Database();
     seedDatabase();
+    ensureColumn('posts','transport_json',"TEXT NOT NULL DEFAULT '{}'");
+    ensureColumn('posts','area_lat','REAL');
+    ensureColumn('posts','area_lng','REAL');
+    for (const statement of fs.readFileSync(path.join(ROOT,'migrations/015_community_tools.sql'),'utf8').split(';').filter(part=>part.trim()&&!part.trim().startsWith('ALTER TABLE'))) run(statement);
+    for (const statement of campaignSchema.split(';').filter(part => part.trim())) run(statement);
+    for (const col of ['stripe_live_account_id','stripe_test_account_id','stripe_live_account_version','stripe_test_account_version','stripe_checked_at']) ensureColumn('users',col,'TEXT');
+    ensureColumn('users','stripe_status_json',"TEXT NOT NULL DEFAULT '{}'");
+    for (const col of ['provider_account_id','provider_payment_intent','provider_request_json','dispute_id','dispute_status','refund_id','refund_status','refund_requested_at','reconciled_at','reconcile_after','reconcile_until']) ensureColumn('payments',col,'TEXT');
+    ensureColumn('payments','provider_livemode','INTEGER');
+    ensureColumn('payments','refunded_amount_cents','INTEGER NOT NULL DEFAULT 0');
+    for (const statement of fs.readFileSync(path.join(ROOT,'migrations/20261109_stripe_production.sql'),'utf8').split(';').filter(part=>part.trim()&&!part.trim().startsWith('ALTER TABLE'))) run(statement);
+    for (const statement of fs.readFileSync(path.join(ROOT,'migrations/20261110_stripe_account_link_history.sql'),'utf8').split(';').filter(part=>part.trim())) run(statement);
+
+    persistDb();
     console.log('[database] SQLite fallback enabled explicitly');
   }
   eventPublisher = new EventPublisher({ url: process.env.AMQP_URL, exchange: process.env.EVENT_EXCHANGE || 'reusa.events' });
@@ -1291,7 +1670,7 @@ async function start() {
 
   const upload = multer({
     storage: objectUploadStorage,
-    limits: { fileSize: 5 * 1024 * 1024, files: 1 },
+    limits: { fileSize: 5 * 1024 * 1024, files: 8 },
     fileFilter: (_req, file, callback) => {
       if (IMAGE_EXTENSIONS.has(file.mimetype)) {
         return callback(null, true);
@@ -1300,10 +1679,13 @@ async function start() {
     }
   });
 
+  const postUpload = createPostUpload({ uploadDir: UPLOAD_DIR, objectStorage });
+
   const authRateLimit = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 30 });
   const publicLookupRateLimit = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 60 });
+  const mapRouteRateLimit = createRateLimiter({ windowMs: 15 * 60 * 1000, maxRequests: 60 });
 
-  app.use(express.json({ limit: '100kb' }));
+  app.use(express.json({ limit: '100kb', verify: (req, _res, buf) => { if (['/api/payments/stripe/webhook','/api/payments/stripe/accounts-webhook'].includes(req.path)) req.rawBody = Buffer.from(buf); } }));
   app.use(express.urlencoded({ extended: true }));
   app.use(requestMetrics);
   app.use((req, res, next) => {
@@ -1311,6 +1693,18 @@ async function start() {
     res.setHeader('X-Correlation-Id', req.correlationId);
     next();
   });
+  const communityWorkflow=registerCommunityRoutes(app,{postgres:postgresEnabled()?postgres:null,sqlite:{all,run,persist:persistDb},authenticate:authMiddleware,flush:flushPendingEvents});
+  const checkDiscovery=()=>communityWorkflow.runDiscovery().catch(error=>console.error('[discovery]',error.message));
+  await checkDiscovery();
+  setInterval(checkDiscovery,60000).unref();
+  const deliveryWorkflow = registerDeliveryRoutes(app, { postgres: postgresEnabled() ? postgres : null, sqlite: { all, run, persist: persistDb }, authenticate: authMiddleware, flush: flushPendingEvents, refreshMetrics: () => { for (const user of all('SELECT id FROM users')) refreshUserMetrics(user.id); persistDb(); } });
+  const checkDeliveryReminders = () => deliveryWorkflow.runReminders().catch(error => console.error('[delivery-reminders]', error.message));
+  await checkDeliveryReminders();
+  setInterval(checkDeliveryReminders, 60000).unref();
+  const stripeWorkflow = registerStripeRoutes(app, {postgres:postgresEnabled()?postgres:null, sqlite:{all,run,persist:persistDb}, authenticate:authMiddleware, jwt, jwtSecret:JWT_SECRET});
+  const reconcileStripe = () => stripeWorkflow.runReconciliation().catch(error => console.error('[stripe-worker]', {status:error.status}));
+  void reconcileStripe();
+  setInterval(reconcileStripe, 60000).unref();
   if (postgresEnabled()) {
     registerPostgresRoutes(app, {
       db: postgres,
@@ -1318,9 +1712,16 @@ async function start() {
       createToken,
       uid,
       publisher: { flush: flushPendingEvents },
-      upload
+      upload,
+      postUpload,
+      sendVerificationEmail,
+      sendPasswordResetEmail,
+      verificationToken,
+      sha256,
+      isConfiguredAdminEmail
     });
   }
+  registerCampaignRoutes(app, { postgres: postgresEnabled() ? postgres : null, sqlite: { all, run, persist: persistDb }, authenticate: authMiddleware, flush: flushPendingEvents });
   app.use('/uploads', express.static(UPLOAD_DIR));
 
   app.get('/api/health/live', (_req, res) => res.json({ ok: true, status: 'live' }));
@@ -1341,6 +1742,49 @@ async function start() {
   });
 
   app.get('/api/health', (_req, res) => res.json({ ok: true }));
+
+  app.get('/api/map-route', mapRouteRateLimit, async (req, res) => {
+    const fromLat = routeCoordinate(req.query.fromLat, -90, 90);
+    const fromLng = routeCoordinate(req.query.fromLng, -180, 180);
+    const toLat = routeCoordinate(req.query.toLat, -90, 90);
+    const toLng = routeCoordinate(req.query.toLng, -180, 180);
+    if ([fromLat, fromLng, toLat, toLng].some((coordinate) => coordinate === null)) {
+      return res.status(400).json({ error: 'Informe coordenadas válidas de origem e destino.' });
+    }
+
+    const cacheKey = `map-route:${fromLat.toFixed(5)},${fromLng.toFixed(5)}:${toLat.toFixed(5)},${toLng.toFixed(5)}`;
+    const cached = cachedExternalValue(cacheKey);
+    if (cached) {
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      return res.json({ route: cached, cached: true });
+    }
+
+    try {
+      const response = await fetchWithTimeout(osrmRouteUrl({ fromLat, fromLng, toLat, toLng }), {
+        headers: { Accept: 'application/json', 'User-Agent': 'ReusaPlus/1.0' },
+        redirect: 'error'
+      }, 8_000);
+      const contentLength = Number(response.headers.get('content-length'));
+      if (Number.isFinite(contentLength) && contentLength > 2_000_000) {
+        throw new Error('Routing response exceeded the allowed size');
+      }
+      const result = await response.json();
+      if (result?.code === 'NoRoute') {
+        return res.status(404).json({ error: 'Não foi possível encontrar uma rota entre os locais selecionados.' });
+      }
+      const route = sanitizedRoute(result?.routes?.[0]);
+      if (!route) {
+        console.warn('[map-route] Routing provider returned an invalid route');
+        return res.status(502).json({ error: 'O serviço de rotas retornou uma resposta inválida.' });
+      }
+
+      res.setHeader('Cache-Control', 'private, max-age=300');
+      return res.json({ route: cacheExternalValue(cacheKey, route, 5 * 60 * 1000), cached: false });
+    } catch (error) {
+      console.warn('[map-route] Routing request failed:', error.message);
+      return res.status(503).json({ error: 'O serviço de rotas está indisponível no momento.' });
+    }
+  });
 
   app.get('/metrics', (req, res) => {
     if (SERVICE_AUTH_TOKEN && req.get('authorization') !== `Bearer ${SERVICE_AUTH_TOKEN}`) {
@@ -1420,6 +1864,7 @@ async function start() {
     res.json({ user: req.user });
   });
 
+
   app.get('/api/auth/google', (req, res) => {
     const returnTo = safeReturnTo(req.query.return_to);
     if (!googleOauthEnabled()) {
@@ -1472,7 +1917,7 @@ async function start() {
     }
   });
 
-  app.post('/api/auth/register', authRateLimit, (req, res) => {
+  app.post('/api/auth/register', authRateLimit, async (req, res, next) => {
     const { name, email, password, city, neighborhood = '', cep = '', address = '', interests = [], accountType = 'person', businessName = '', cnpj = '' } = req.body || {};
     const normalizedName = String(name || '').trim();
     const normalizedEmail = String(email || '').trim().toLowerCase();
@@ -1484,7 +1929,7 @@ async function start() {
     const normalizedCnpj = String(cnpj || '').replace(/\D/g, '');
 
     if (!normalizedName || !normalizedEmail || !normalizedPassword || !normalizedCity) {
-      return res.status(400).json({ error: 'Missing required fields' });
+      return res.status(400).json({ error: 'Informe nome, e-mail, senha e cidade para criar a conta.' });
     }
 
     if (!['person', 'business'].includes(normalizedAccountType)) {
@@ -1500,11 +1945,11 @@ async function start() {
     }
 
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) {
-      return res.status(400).json({ error: 'Invalid email address' });
+      return res.status(400).json({ error: 'Informe um e-mail válido, como nome@gmail.com, nome@outlook.com ou outro domínio existente.' });
     }
 
     if (normalizedPassword.length < 8) {
-      return res.status(400).json({ error: 'Password must contain at least 8 characters' });
+      return res.status(400).json({ error: 'A senha precisa ter pelo menos 8 caracteres.' });
     }
 
     const existingUser = get('SELECT id FROM users WHERE lower(email) = lower(?)', [normalizedEmail]);
@@ -1532,10 +1977,11 @@ async function start() {
       carbonSavedPercent: 0,
       achievements: ['Novo membro']
     };
+    const verification = verificationToken();
 
     run(
-      `INSERT INTO users (id, name, email, password_hash, city, neighborhood, cep, address, account_type, business_name, cnpj, interests_json, avatar, rating, donations, received, carbon_saved_percent, achievements_json)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO users (id, name, email, password_hash, city, neighborhood, cep, address, account_type, business_name, cnpj, interests_json, avatar, rating, donations, received, carbon_saved_percent, achievements_json, email_verified, email_verification_token_hash, email_verification_expires_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)` ,
       [
         user.id,
         user.name,
@@ -1554,13 +2000,26 @@ async function start() {
         user.donations,
         user.received,
         user.carbonSavedPercent,
-        JSON.stringify(user.achievements)
+        JSON.stringify(user.achievements),
+        0,
+        verification.hash,
+        verification.expiresAt
       ]
     );
     run('UPDATE users SET last_active_at = ?, created_at = ? WHERE id = ?', [new Date().toISOString(), new Date().toISOString(), user.id]);
     persistDb();
 
-    return res.status(201).json({ token: createToken(user.id), user: { ...user, passwordHash: undefined } });
+    try {
+      const delivery = await sendVerificationEmail(user.email, user.name, verification.raw, `${req.protocol}://${req.get('host')}`);
+      return res.status(201).json({ token: createToken(user.id), user: { ...user, passwordHash: undefined, emailVerified: false }, verificationRequired: true, emailDelivered: delivery.delivered });
+    } catch (error) {
+      const requestId = req.correlationId || uid('request');
+      console.error(`[registration-email-error] ${requestId}:`, error);
+      return res.status(503).json({
+        error: 'A conta foi criada, mas não foi possível enviar o e-mail de confirmação. Configure SMTP_HOST, SMTP_USER, SMTP_PASSWORD e EMAIL_FROM e tente reenviar a confirmação.',
+        requestId
+      });
+    }
   });
 
   app.post('/api/auth/login', authRateLimit, (req, res) => {
@@ -1576,11 +2035,68 @@ async function start() {
     if (!user || !verifyPassword(normalizedPassword, user.password_hash)) {
       return res.status(401).json({ error: 'Invalid credentials' });
     }
+    if (user.email_verified === 0) return res.status(403).json({ error: 'Confirme seu e-mail antes de entrar' });
 
     const normalized = userFromRow(user);
     run('UPDATE users SET last_active_at = ? WHERE id = ?', [new Date().toISOString(), normalized.id]);
     persistDb();
     return res.json({ token: createToken(normalized.id), user: normalized });
+  });
+
+  app.post('/api/auth/forgot-password', authRateLimit, async (req, res, next) => {
+    try {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const generic = { message: 'Se existir uma conta com este e-mail, enviaremos um link para redefinir a senha.' };
+      if (!email || !isValidEmailFormat(email)) return res.json(generic);
+      const user = get('SELECT id,name,email FROM users WHERE lower(email) = lower(?)', [email]);
+      if (!user) return res.json(generic);
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      run('UPDATE users SET password_reset_token_hash = ?, password_reset_expires_at = ? WHERE id = ?', [sha256(rawToken), expiresAt, user.id]);
+      persistDb();
+      try {
+        await sendPasswordResetEmail(user.email, user.name, rawToken, `${req.protocol}://${req.get('host')}`);
+      } catch (error) {
+        const requestId = req.correlationId || uid('request');
+        console.error(`[password-reset-email-error] ${requestId}:`, error);
+        return res.status(503).json({ error: 'Não foi possível enviar o e-mail de redefinição. Tente novamente mais tarde.', requestId });
+      }
+      return res.json(generic);
+    } catch (error) { return next(error); }
+  });
+
+  app.post('/api/auth/reset-password', authRateLimit, (req, res) => {
+    const tokenHash = sha256(String(req.body?.token || ''));
+    const password = String(req.body?.password || '');
+    if (password.length < 8) return res.status(400).json({ error: 'A senha precisa ter pelo menos 8 caracteres.' });
+    const user = get('SELECT id FROM users WHERE password_reset_token_hash = ? AND password_reset_expires_at > ?', [tokenHash, new Date().toISOString()]);
+    if (!user) return res.status(400).json({ error: 'O link de redefinição é inválido ou expirou. Solicite um novo link.' });
+    run('UPDATE users SET password_hash = ?, email_verified = 1, password_reset_token_hash = NULL, password_reset_expires_at = NULL WHERE id = ?', [passwordHash(password), user.id]);
+    persistDb();
+    return res.json({ ok: true });
+  });
+
+  app.get('/api/auth/verify-email', async (req, res) => {
+    const tokenHash = sha256(String(req.query.token || ''));
+    const user = get('SELECT id, email FROM users WHERE email_verification_token_hash = ? AND email_verification_expires_at > ?', [tokenHash, new Date().toISOString()]);
+    if (!user) return res.status(400).send('Link de verificação inválido ou expirado. Solicite um novo link pelo aplicativo.');
+    run('UPDATE users SET email_verified = 1, email_verification_token_hash = NULL, email_verification_expires_at = NULL WHERE id = ?', [user.id]);
+    if (isConfiguredAdminEmail(user.email)) run("UPDATE users SET role = 'admin' WHERE id = ?", [user.id]);
+    persistDb();
+    return res.redirect('/login#email_verified=1');
+  });
+
+  app.post('/api/auth/resend-verification', authMiddleware, async (req, res, next) => {
+    try {
+      const user = get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+      if (!user) return res.status(404).json({ error: 'User not found' });
+      if (user.email_verified !== 0) return res.json({ emailVerified: true });
+      const verification = verificationToken();
+      run('UPDATE users SET email_verification_token_hash = ?, email_verification_expires_at = ? WHERE id = ?', [verification.hash, verification.expiresAt, user.id]);
+      const delivery = await sendVerificationEmail(user.email, user.name, verification.raw, `${req.protocol}://${req.get('host')}`);
+      persistDb();
+      return res.json({ emailVerified: false, emailDelivered: delivery.delivered });
+    } catch (error) { return next(error); }
   });
 
   app.get('/api/feed', optionalAuth, (req, res) => {
@@ -1650,7 +2166,7 @@ async function start() {
   });
 
   app.get('/api/favorites', authMiddleware, (req, res) => {
-    const rows = all('SELECT posts.* FROM favorites JOIN posts ON posts.id = favorites.post_id WHERE favorites.user_id = ? ORDER BY favorites.created_at DESC', [req.user.id]);
+    const rows = all("SELECT posts.* FROM favorites JOIN posts ON posts.id = favorites.post_id WHERE favorites.user_id = ? AND posts.status <> 'Encerrado' ORDER BY favorites.created_at DESC", [req.user.id]);
     res.json({ posts: rows.map((row) => publicPost(row, req.user.id)) });
   });
 
@@ -1705,16 +2221,18 @@ async function start() {
     negotiationIds.forEach((id) => run('DELETE FROM reviews WHERE negotiation_id = ?', [id]));
     run('DELETE FROM negotiations WHERE post_id = ?', [req.params.id]);
     run('DELETE FROM reports WHERE target_type = ? AND target_id = ?', ['post', req.params.id]);
+    run('DELETE FROM post_images WHERE post_id = ?', [req.params.id]);
+    run('DELETE FROM post_videos WHERE post_id = ?', [req.params.id]);
     run('DELETE FROM posts WHERE id = ?', [req.params.id]);
     persistDb();
     res.json({ ok: true });
   });
 
-  app.put('/api/posts/:id', authMiddleware, upload.single('image'), (req, res) => {
+  app.put('/api/posts/:id', authMiddleware, postUpload, (req, res) => {
     const post = get('SELECT * FROM posts WHERE id = ?', [req.params.id]);
     if (!post) return res.status(404).json({ error: 'Post not found' });
     if (post.author_id !== req.user.id) return res.status(403).json({ error: 'You can only edit your own posts' });
-    if (['Doado', 'Trocado', 'Encerrado'].includes(post.status)) return res.status(400).json({ error: 'Completed posts cannot be edited' });
+    if (['Doado', 'Trocado', 'Vendido', 'Encerrado'].includes(post.status)) return res.status(400).json({ error: 'Completed posts cannot be edited' });
     const title = typeof req.body?.title === 'string' ? req.body.title.trim() : post.title;
     const description = typeof req.body?.description === 'string' ? req.body.description.trim() : post.description;
     const category = typeof req.body?.category === 'string' ? req.body.category.trim() : post.category;
@@ -1723,11 +2241,20 @@ async function start() {
     const location = typeof req.body?.location === 'string' ? req.body.location.trim() : post.location;
     if (!title || !description || !category) return res.status(400).json({ error: 'Title, description and category are required' });
     if (title.length > 140 || description.length > 3000 || category.length > 60 || condition.length > 60 || goal.length > 40 || location.length > 160) return res.status(400).json({ error: 'One or more fields exceed the allowed length' });
+    if (!POST_GOALS.has(goal)) return res.status(400).json({ error: 'Goal must be Doação, Troca or Venda' });
     if (isLikelyResidentialAddress(location)) return res.status(400).json({ error: 'Location must be a city or neighborhood, not an exact address' });
-    const imageUrl = req.file ? (req.file.location || `/uploads/${req.file.filename}`) : post.image_url;
+    let media;
+    try { media = postMedia(post, req.body, req.files); }
+    catch (error) { return res.status(error.status || 400).json({ error: error.message }); }
     const updatedAt = new Date().toISOString();
-    run('UPDATE posts SET title = ?, description = ?, category = ?, condition = ?, goal = ?, location = ?, image_url = ?, updated_at = ? WHERE id = ?', [title, description, category, condition, goal, location, imageUrl, updatedAt, post.id]);
+    try {
+      db.exec('BEGIN TRANSACTION');
+      run('UPDATE posts SET title = ?, description = ?, category = ?, condition = ?, goal = ?, location = ?, image_url = ?, updated_at = ? WHERE id = ?', [title, description, category, condition, goal, location, media.cover, updatedAt, post.id]);
+      savePostMedia(post.id, media, updatedAt);
+      db.exec('COMMIT');
+    } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
     persistDb();
+    req.postMediaCommitted = true;
     return res.json({ post: publicPost(get('SELECT * FROM posts WHERE id = ?', [post.id]), req.user.id) });
   });
 
@@ -1737,16 +2264,98 @@ async function start() {
     if (post.author_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can view interested users' });
     const negotiations = all('SELECT * FROM negotiations WHERE post_id = ? ORDER BY created_at DESC', [post.id]).map((item) => {
       const user = get('SELECT id, name, city, avatar FROM users WHERE id = ?', [item.interested_id]);
-      return { id: item.id, status: item.status, createdAt: item.created_at, threadId: item.thread_id, user: user ? { ...user, avatar: safeAvatar(user.avatar) } : null };
+      return { id: item.id, status: item.status, canCancelAcceptance: item.status === 'reserved' && item.proposal_status === 'accepted' && !get('SELECT id FROM collection_deliveries WHERE negotiation_id = ?', [item.id]) && !get('SELECT id FROM payments WHERE negotiation_id = ? LIMIT 1', [item.id]), proposalStatus: item.proposal_status || 'none', proposalAmountCents: item.proposal_amount_cents || null, proposalMethod: item.proposal_method || null, proposalCreatedAt: item.proposal_created_at || null, createdAt: item.created_at, threadId: item.thread_id, user: user ? { ...user, avatar: safeAvatar(user.avatar) } : null };
     });
     return res.json({ negotiations });
   });
 
   app.get('/api/posts/:id/negotiation', authMiddleware, (req, res) => {
-    const post = get('SELECT id, author_id FROM posts WHERE id = ?', [req.params.id]);
+    const post = get('SELECT id, author_id, goal FROM posts WHERE id = ?', [req.params.id]);
     if (!post) return res.status(404).json({ error: 'Post not found' });
-    const negotiation = get('SELECT * FROM negotiations WHERE post_id = ? AND (owner_id = ? OR interested_id = ?) ORDER BY updated_at DESC LIMIT 1', [post.id, req.user.id, req.user.id]);
-    return res.json({ negotiation: negotiation ? { id: negotiation.id, status: negotiation.status, ownerId: negotiation.owner_id, interestedId: negotiation.interested_id, completedAt: negotiation.completed_at } : null });
+    const negotiation = get("SELECT * FROM negotiations WHERE post_id = ? AND (owner_id = ? OR interested_id = ?) ORDER BY CASE WHEN status='reserved' THEN 0 WHEN status='completed' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1", [post.id, req.user.id, req.user.id]);
+    const canCancelOffer=Boolean(negotiation&&post.goal===SALE_GOAL&&negotiation.interested_id===req.user.id&&negotiation.status==='interested'&&negotiation.proposal_status==='pending'&&!get('SELECT id FROM collection_deliveries WHERE negotiation_id=?',[negotiation.id])&&!get('SELECT id FROM payments WHERE negotiation_id=? LIMIT 1',[negotiation.id]));
+    return res.json({ negotiation: negotiation ? { id: negotiation.id, status: negotiation.status, threadId: negotiation.thread_id, ownerId: negotiation.owner_id, interestedId: negotiation.interested_id, canCancelOffer, completedAt: negotiation.completed_at, proposalStatus: negotiation.proposal_status || 'none', proposalAmountCents: negotiation.proposal_amount_cents || null, proposalMethod: negotiation.proposal_method || null, proposalCreatedAt: negotiation.proposal_created_at || null } : null });
+  });
+
+  app.post('/api/negotiations/:id/proposal', authMiddleware, (req, res) => {
+    const negotiation = get('SELECT * FROM negotiations WHERE id = ?', [req.params.id]);
+    const amountCents = req.body?.amountCents !== undefined
+      ? Number(req.body.amountCents)
+      : parseMoneyToCents(req.body?.amount);
+    const method = String(req.body?.method || '').trim().toLowerCase();
+    if (!negotiation) return res.status(404).json({ error: 'Negotiation not found' });
+    if (negotiation.interested_id !== req.user.id) return res.status(403).json({ error: 'Only the interested user can send this proposal' });
+    const resending=negotiation.status==='cancelled'&&negotiation.proposal_status==='cancelled';
+    if (negotiation.status !== 'interested'&&!resending) return res.status(400).json({ error: 'This negotiation is no longer accepting proposals' });
+    const post = get('SELECT goal,status FROM posts WHERE id = ?', [negotiation.post_id]);
+    if (!post || post.goal !== SALE_GOAL) return res.status(400).json({ error: 'Money offers are only available for items marked for sale' });
+    if (negotiation.proposal_status && negotiation.proposal_status !== 'none'&&!resending) return res.status(409).json({ error: 'Você já enviou uma oferta para este anúncio.' });
+    if(resending&&(post.status!=='Disponível'||get("SELECT id FROM collection_deliveries WHERE negotiation_id=? AND status<>'cancelled'",[negotiation.id])||get("SELECT id FROM payments WHERE negotiation_id=? AND status IN ('processing','succeeded') LIMIT 1",[negotiation.id])))return res.status(409).json({error:'Esta negociação não está disponível para uma nova oferta.'});
+    if (!Number.isSafeInteger(amountCents) || amountCents < 100 || amountCents > 100000000) return res.status(400).json({ error: 'Amount must be between R$ 1,00 and R$ 1.000.000,00' });
+    if (!['pix', 'card'].includes(method)) return res.status(400).json({ error: 'Use pix ou cartão' });
+    if (method === 'pix' && process.env.STRIPE_PIX_ENABLED !== 'true') return res.status(409).json({ error: 'Pix ainda não está habilitado nesta integração Stripe. Escolha cartão.' });
+    const previousCreatedAt=Date.parse(negotiation.proposal_created_at||'');
+    const now = new Date(Math.max(Date.now(),Number.isFinite(previousCreatedAt)?previousCreatedAt+1:0)).toISOString();
+    run("UPDATE negotiations SET status='interested',proposal_status = 'pending', proposal_amount_cents = ?, proposal_method = ?, proposal_created_at = ?, updated_at = ? WHERE id = ?", [amountCents, method, now, now, negotiation.id]);
+    if (!eventPublisher.enabled()) notification(negotiation.owner_id, 'negotiation', 'Nova proposta recebida', `Uma proposta de ${formatMoney(amountCents)} foi enviada.`, `/anuncios/${negotiation.post_id}`);
+    persistDb();
+    return res.status(201).json({ proposal: { negotiationId: negotiation.id, status: 'pending', amountCents, method, createdAt: now } });
+  });
+
+  app.patch('/api/negotiations/:id/proposal', authMiddleware, (req, res) => {
+    const negotiation = get('SELECT * FROM negotiations WHERE id = ?', [req.params.id]);
+    const decision = String(req.body?.decision || '').trim().toLowerCase();
+    if (!negotiation) return res.status(404).json({ error: 'Negotiation not found' });
+    if (negotiation.owner_id !== req.user.id) return res.status(403).json({ error: 'Only the seller can decide this proposal' });
+    if (!['accepted', 'rejected'].includes(decision)) return res.status(400).json({ error: 'Decision must be accepted or rejected' });
+    const post = get('SELECT * FROM posts WHERE id = ?', [negotiation.post_id]);
+    if (post?.goal === SALE_GOAL) {
+      const expected = typeof req.body?.expectedProposalCreatedAt === 'string' ? Date.parse(req.body.expectedProposalCreatedAt) : NaN;
+      if (!Number.isFinite(expected)) return res.status(400).json({ error: 'Atualize a oferta antes de responder.' });
+      if (new Date(negotiation.proposal_created_at).getTime() !== expected) return res.status(409).json({ error: 'A oferta foi atualizada. Confira o valor e a forma de pagamento antes de responder.' });
+    }
+    if (negotiation.proposal_status !== 'pending' && !(decision === 'accepted' && negotiation.proposal_status === 'rejected')) return res.status(400).json({ error: 'There is no pending proposal to decide' });
+    const now = new Date().toISOString();
+    if (decision === 'accepted') {
+      if (!post || post.goal !== SALE_GOAL) return res.status(400).json({ error: 'Only sale offers can be accepted here' });
+      if (!['Disponível', 'Reservado'].includes(post.status || 'Disponível') ||
+          (post.status === 'Reservado' && post.reserved_by !== negotiation.interested_id) ||
+          !['interested', 'reserved'].includes(negotiation.status)) {
+        return res.status(409).json({ error: 'Este anúncio já está reservado para outra pessoa ou não está disponível.' });
+      }
+      if (stripe.configured() && !stripe.demoEnabled()) {
+        const seller = get('SELECT stripe_account_id FROM users WHERE id = ?', [req.user.id]);
+        if (!seller?.stripe_account_id) {
+          return res.status(409).json({ error: 'Conecte sua conta Stripe antes de receber pagamentos.' });
+        }
+      }
+      try {
+        db.exec('BEGIN TRANSACTION');
+        run("UPDATE negotiations SET status='interested',proposal_status=CASE WHEN proposal_status='pending' THEN 'rejected' ELSE proposal_status END,updated_at=? WHERE post_id=? AND id<>? AND status='reserved'", [now, post.id, negotiation.id]);
+        run("UPDATE negotiations SET proposal_status='accepted',status='reserved',updated_at=? WHERE id=?", [now, negotiation.id]);
+        run("UPDATE posts SET status='Reservado',reserved_by=?,updated_at=? WHERE id=?", [negotiation.interested_id, now, post.id]);
+        emitDomainEvent('negotiation.reserved', { negotiationId: negotiation.id, postId: post.id, postTitle: post.title, ownerId: post.author_id, interestedId: negotiation.interested_id, status: 'reserved' }, req.correlationId);
+        db.exec('COMMIT');
+      } catch (error) {
+        try { db.exec('ROLLBACK'); } catch {}
+        return res.status(500).json({ error: 'Não foi possível reservar o anúncio.' });
+      }
+      if (!eventPublisher.enabled()) notification(negotiation.interested_id, 'negotiation', 'Oferta aceita e item reservado', `Combine e aceite a entrega de ${post.title} antes de pagar.`, `/anuncios/${post.id}`);
+    } else {
+      run('UPDATE negotiations SET proposal_status = ?, updated_at = ? WHERE id = ?', [decision, now, negotiation.id]);
+      if (!eventPublisher.enabled()) notification(negotiation.interested_id, 'negotiation', 'Proposta recusada', 'O vendedor recusou sua proposta.', `/anuncios/${negotiation.post_id}`);
+    }
+    persistDb();
+    return res.json({ proposal: { negotiationId: negotiation.id, status: decision, amountCents: negotiation.proposal_amount_cents, method: negotiation.proposal_method, createdAt: negotiation.proposal_created_at }, reserved: decision === 'accepted' });
+  });
+  app.get('/api/profile/payment-items', authMiddleware, (req, res) => {
+    const rows = all(`SELECT n.id AS negotiation_id,n.status,n.proposal_status,n.proposal_amount_cents,n.proposal_method,n.proposal_created_at,p.id AS post_id,p.title,p.image_url,p.location
+      FROM negotiations n JOIN posts p ON p.id=n.post_id
+      WHERE p.status <> 'Encerrado' AND n.interested_id = ? AND n.proposal_status IN ('pending','accepted') AND n.status IN ('interested','reserved')
+      ORDER BY n.updated_at DESC`, [req.user.id]);
+    const payments = all("SELECT negotiation_id,status,checkout_url FROM payments WHERE payer_id = ? AND status IN ('processing','failed') ORDER BY created_at DESC", [req.user.id]);
+    const paymentByNegotiation = new Map(payments.map((payment) => [payment.negotiation_id, payment]));
+    return res.json({ items: rows.map((row) => ({ negotiationId: row.negotiation_id, postId: row.post_id, title: row.title, imageUrl: row.image_url, location: row.location, negotiationStatus: row.status, proposalStatus: row.proposal_status, amountCents: row.proposal_amount_cents, method: row.proposal_method, createdAt: row.proposal_created_at, payment: paymentByNegotiation.get(row.negotiation_id) || null })) });
   });
 
   app.post('/api/posts/:id/reserve', authMiddleware, (req, res) => {
@@ -1754,12 +2363,21 @@ async function start() {
     const interestedId = String(req.body?.interestedId || '');
     if (!post) return res.status(404).json({ error: 'Post not found' });
     if (post.author_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can reserve this post' });
+    if (post.goal === SALE_GOAL && stripe.configured() && !stripe.demoEnabled()) {
+      const seller = get('SELECT stripe_account_id FROM users WHERE id = ?', [req.user.id]);
+      if (!seller?.stripe_account_id) return res.status(409).json({ error: 'Conecte sua conta Stripe antes de reservar o anúncio.' });
+    }
     if (!['Disponível', 'Reservado'].includes(post.status || 'Disponível')) return res.status(400).json({ error: 'This post is no longer available' });
     const negotiation = get('SELECT * FROM negotiations WHERE post_id = ? AND interested_id = ?', [post.id, interestedId]);
     if (!negotiation || negotiation.status === 'cancelled') return res.status(400).json({ error: 'Choose a user who demonstrated interest' });
+    if (post.goal === SALE_GOAL) {
+      const expected = typeof req.body?.expectedProposalCreatedAt === 'string' ? Date.parse(req.body.expectedProposalCreatedAt) : NaN;
+      if (!Number.isFinite(expected)) return res.status(400).json({ error: 'Atualize a oferta antes de reservar o item.' });
+      if (new Date(negotiation.proposal_created_at).getTime() !== expected) return res.status(409).json({ error: 'A oferta foi atualizada. Confira o valor e a forma de pagamento antes de reservar.' });
+    }
     const now = new Date().toISOString();
     run("UPDATE negotiations SET status = 'interested', updated_at = ? WHERE post_id = ? AND status = 'reserved'", [now, post.id]);
-    run("UPDATE negotiations SET status = 'reserved', updated_at = ? WHERE id = ?", [now, negotiation.id]);
+    run("UPDATE negotiations SET status = 'reserved', proposal_status = CASE WHEN proposal_status = 'pending' THEN 'accepted' ELSE proposal_status END, updated_at = ? WHERE id = ?", [now, negotiation.id]);
     run("UPDATE posts SET status = 'Reservado', reserved_by = ?, updated_at = ? WHERE id = ?", [interestedId, now, post.id]);
     if (!eventPublisher.enabled()) notification(interestedId, 'negotiation', 'Item reservado para você', `Você foi selecionado para ${post.title}.`, `/anuncios/${post.id}`);
     emitDomainEvent('negotiation.reserved', {
@@ -1774,34 +2392,6 @@ async function start() {
     return res.json({ post: publicPost(get('SELECT * FROM posts WHERE id = ?', [post.id]), req.user.id) });
   });
 
-  app.post('/api/posts/:id/complete', authMiddleware, (req, res) => {
-    const post = get('SELECT * FROM posts WHERE id = ?', [req.params.id]);
-    const outcome = String(req.body?.outcome || '').trim();
-    if (!post) return res.status(404).json({ error: 'Post not found' });
-    if (post.author_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can complete this post' });
-    if (!post.reserved_by || post.status !== 'Reservado') return res.status(400).json({ error: 'Reserve the item before completing the negotiation' });
-    if (!['Doado', 'Trocado'].includes(outcome)) return res.status(400).json({ error: 'Choose Doado or Trocado as the outcome' });
-    const negotiation = get("SELECT * FROM negotiations WHERE post_id = ? AND interested_id = ? AND status = 'reserved'", [post.id, post.reserved_by]);
-    if (!negotiation) return res.status(400).json({ error: 'Reserved negotiation not found' });
-    const now = new Date().toISOString();
-    run("UPDATE negotiations SET status = 'completed', completed_at = ?, updated_at = ? WHERE id = ?", [now, now, negotiation.id]);
-    run('UPDATE posts SET status = ?, completed_with = ?, completed_at = ?, updated_at = ? WHERE id = ?', [outcome, post.reserved_by, now, now, post.id]);
-    refreshUserMetrics(post.author_id);
-    refreshUserMetrics(post.reserved_by);
-    if (!eventPublisher.enabled()) notification(post.reserved_by, 'negotiation', 'Negociação concluída', `A negociação de ${post.title} foi concluída. Avalie a experiência.`, `/anuncios/${post.id}`);
-    emitDomainEvent('negotiation.completed', {
-      negotiationId: negotiation.id,
-      postId: post.id,
-      postTitle: post.title,
-      ownerId: post.author_id,
-      interestedId: post.reserved_by,
-      outcome,
-      completedAt: now
-    }, req.correlationId);
-    persistDb();
-    return res.json({ post: publicPost(get('SELECT * FROM posts WHERE id = ?', [post.id]), req.user.id), negotiationId: negotiation.id });
-  });
-
   app.patch('/api/posts/:id/status', authMiddleware, (req, res) => {
     const post = get('SELECT * FROM posts WHERE id = ?', [req.params.id]);
     const status = String(req.body?.status || '').trim();
@@ -1810,6 +2400,7 @@ async function start() {
     if (!['Disponível', 'Encerrado'].includes(status)) return res.status(400).json({ error: 'Use the reservation or completion flow for this status' });
     const now = new Date().toISOString();
     run('UPDATE posts SET status = ?, reserved_by = CASE WHEN ? = ? THEN NULL ELSE reserved_by END, updated_at = ? WHERE id = ?', [status, status, 'Disponível', now, post.id]);
+    if (status === 'Encerrado') run('DELETE FROM favorites WHERE post_id = ?', [post.id]);
     if (status === 'Disponível') run("UPDATE negotiations SET status = 'interested', updated_at = ? WHERE post_id = ? AND status = 'reserved'", [now, post.id]);
     persistDb();
     return res.json({ post: publicPost(get('SELECT * FROM posts WHERE id = ?', [post.id]), req.user.id) });
@@ -1891,7 +2482,8 @@ async function start() {
     res.status(201).json({ comment: { ...comment, name: req.user.name, avatar: req.user.avatar }, comments: get('SELECT comments FROM posts WHERE id = ?', [req.params.id]).comments });
   });
 
-  app.post('/api/posts', authMiddleware, upload.single('image'), (req, res) => {
+  app.post('/api/posts', authMiddleware, postUpload, (req, res) => {
+    let extras; try { extras=postExtras(req.body,{requireTransport:true}); } catch(error) {return res.status(error.status||400).json({error:error.message});}
     const { title, description, category, condition, goal, location, chipLabel, chipIcon } = req.body || {};
     const normalizedTitle = String(title || '').trim();
     const normalizedDescription = String(description || '').trim();
@@ -1901,15 +2493,22 @@ async function start() {
       return res.status(400).json({ error: 'Missing required fields' });
     }
 
-    if (!req.file && !String(req.body?.imageUrl || '').trim()) {
-      return res.status(400).json({ error: 'An image is required for every post' });
-    }
-
     if (normalizedTitle.length > 140 || normalizedDescription.length > 3000 || normalizedCategory.length > 60) {
       return res.status(400).json({ error: 'One or more fields exceed the allowed length' });
     }
 
-    const imageUrl = req.file ? (req.file.location || `/uploads/${req.file.filename}`) : safeImageUrl(req.body.imageUrl, '');
+    const normalizedGoal = String(goal || DONATION_GOAL).trim() || DONATION_GOAL;
+    if (!POST_GOALS.has(normalizedGoal)) {
+      return res.status(400).json({ error: 'Goal must be Doação, Troca or Venda' });
+    }
+
+    let media;
+    try {
+      rejectRemoteVideos(req.body);
+      const imageUrl = req.files?.images?.length ? '' : safeImageUrl(req.body.imageUrl, '');
+      media = postMedia({ id: '', image_url: imageUrl }, req.body, req.files);
+    } catch (error) { return res.status(error.status || 400).json({ error: error.message }); }
+    const imageUrl = media.cover;
     const createdAt = new Date().toISOString();
     const post = {
       id: uid('post'),
@@ -1918,25 +2517,29 @@ async function start() {
       description: normalizedDescription,
       category: normalizedCategory,
       condition: condition || 'Bom estado',
-      goal: goal || 'Doação',
+      goal: normalizedGoal,
       image_url: imageUrl,
       likes: 0,
       comments: 0,
       location: location || req.user.city,
       created_at: createdAt,
-      chip_icon: chipIcon || (goal === 'Troca' ? 'swap_horiz' : 'volunteer_activism'),
-      chip_label: chipLabel || goal || 'Disponível'
+      chip_icon: chipIcon || (normalizedGoal === 'Troca' ? 'swap_horiz' : normalizedGoal === SALE_GOAL ? 'sell' : 'volunteer_activism'),
+      chip_label: chipLabel || normalizedGoal
     };
     if (isLikelyResidentialAddress(post.location)) {
       return res.status(400).json({ error: 'Location must be a city or neighborhood, not an exact address' });
     }
 
+    try {
+      db.exec('BEGIN TRANSACTION');
     run(
       `INSERT INTO posts (id, author_id, title, description, category, condition, goal, image_url, likes, comments, location, created_at, chip_icon, chip_label)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [post.id, post.author_id, post.title, post.description, post.category, post.condition, post.goal, post.image_url, post.likes, post.comments, post.location, post.created_at, post.chip_icon, post.chip_label]
     );
+    savePostMedia(post.id, media, createdAt);
 
+    run('UPDATE posts SET transport_json=?,area_lat=?,area_lng=? WHERE id=?',[extras.json,extras.lat,extras.lng,post.id]);
     const threadId = uid('thread');
     run(
       `INSERT INTO threads (id, post_id, participants_json, unread_count, last_message_at)
@@ -1944,7 +2547,10 @@ async function start() {
       [threadId, post.id, JSON.stringify([req.user.id]), 0, createdAt]
     );
 
+      db.exec('COMMIT');
+    } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; }
     persistDb();
+    req.postMediaCommitted = true;
     return res.status(201).json({ post: publicPost(get('SELECT * FROM posts WHERE id = ?', [post.id])) });
   });
 
@@ -1971,9 +2577,10 @@ async function start() {
     return res.status(201).json({ thread: threadSummary(thread, req.user.id) });
   });
 
-  app.get('/api/messages/threads', authMiddleware, (req, res) => {
+  app.get('/api/messages/threads', authMiddleware, async (req, res) => {
+    const notifications = await notificationsForUser(req.user.id, { limit: null });
     const rows = all('SELECT * FROM threads ORDER BY last_message_at DESC').filter((row) => JSON.parse(row.participants_json || '[]').includes(req.user.id));
-    const threads = rows.map((row) => threadSummary(row, req.user.id));
+    const threads = rows.map((row) => threadSummary(row, req.user.id, { hideCleared: true, notifications })).filter(Boolean);
     res.json({ threads });
   });
 
@@ -1985,8 +2592,53 @@ async function start() {
 
     const participants = JSON.parse(row.participants_json || '[]');
     if (!participants.includes(req.user.id)) return res.status(403).json({ error: 'Thread access denied' });
-    const messages = all('SELECT * FROM messages WHERE thread_id = ? ORDER BY sent_at ASC', [row.id]);
-    res.json({ thread: row, participants: JSON.parse(row.participants_json || '[]'), messages });
+    const clear = get('SELECT cleared_at FROM message_clears WHERE user_id = ? AND thread_id = ?', [req.user.id, row.id]);
+    const messages = clear
+      ? all('SELECT * FROM messages WHERE thread_id = ? AND sent_at > ? ORDER BY sent_at ASC', [row.id, clear.cleared_at])
+      : all('SELECT * FROM messages WHERE thread_id = ? ORDER BY sent_at ASC', [row.id]);
+    res.json({ thread: { ...row, unread_count: threadSummary(row, req.user.id).unreadCount }, participants: JSON.parse(row.participants_json || '[]'), messages });
+  });
+
+  app.delete('/api/messages/threads/:id/messages', authMiddleware, (req, res) => {
+    const thread = get('SELECT id, participants_json, last_message_at FROM threads WHERE id = ?', [req.params.id]);
+    if (!thread) return res.status(404).json({ error: 'Thread not found' });
+    if (!JSON.parse(thread.participants_json || '[]').includes(req.user.id)) return res.status(403).json({ error: 'Thread access denied' });
+    const clearedAt = messageClearTimestamp(req.user.id, [thread]);
+    try {
+      db.exec('BEGIN TRANSACTION');
+      run(
+        'INSERT INTO message_clears (user_id, thread_id, cleared_at) VALUES (?, ?, ?) ON CONFLICT(user_id, thread_id) DO UPDATE SET cleared_at = excluded.cleared_at',
+        [req.user.id, thread.id, clearedAt]
+      );
+      markClearedMessageNoticesRead(req.user.id, thread.id, clearedAt);
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
+    persistDb();
+    return res.json({ ok: true, clearedAt });
+  });
+
+  app.delete('/api/messages/threads', authMiddleware, (req, res) => {
+    const threads = all('SELECT id, participants_json, last_message_at FROM threads').filter((thread) => JSON.parse(thread.participants_json || '[]').includes(req.user.id));
+    const now = messageClearTimestamp(req.user.id, threads);
+    try {
+      db.exec('BEGIN TRANSACTION');
+      threads.forEach((thread) => {
+        run(
+          'INSERT INTO message_clears (user_id, thread_id, cleared_at) VALUES (?, ?, ?) ON CONFLICT(user_id, thread_id) DO UPDATE SET cleared_at = excluded.cleared_at',
+          [req.user.id, thread.id, now]
+        );
+        markClearedMessageNoticesRead(req.user.id, thread.id, now);
+      });
+      db.exec('COMMIT');
+    } catch (error) {
+      try { db.exec('ROLLBACK'); } catch {}
+      throw error;
+    }
+    persistDb();
+    return res.json({ ok: true, clearedAt: now });
   });
 
   app.post('/api/messages/threads/:id/messages', authMiddleware, (req, res) => {
@@ -2009,7 +2661,8 @@ async function start() {
       return res.status(403).json({ error: 'You cannot message a blocked user' });
     }
 
-    const sentAt = new Date().toISOString();
+    const lastClear = get('SELECT MAX(cleared_at) AS cleared_at FROM message_clears WHERE thread_id = ?', [thread.id]);
+    const sentAt = new Date(Math.max(Date.now(), (Date.parse(lastClear?.cleared_at || '') || 0) + 1)).toISOString();
     const message = {
       id: uid('msg'),
       thread_id: thread.id,
@@ -2026,8 +2679,8 @@ async function start() {
     );
     run('UPDATE threads SET last_message_at = ? WHERE id = ?', [sentAt, thread.id]);
     if (recipientId) {
-      if (!eventPublisher.enabled()) notification(recipientId, 'message', 'Nova mensagem', `${req.user.name} enviou uma mensagem.`, `/mensagens/ana?thread=${thread.id}`);
-      emitDomainEvent('message.sent', { messageId: message.id, threadId: thread.id, postId: thread.post_id, senderId: req.user.id, senderName: req.user.name, recipientId, link: `/mensagens/ana?thread=${thread.id}` }, req.correlationId);
+      if (!eventPublisher.enabled()) notification(recipientId, 'message', 'Nova mensagem', `${req.user.name} enviou uma mensagem.`, `/mensagens/ana?thread=${thread.id}`, sentAt);
+      emitDomainEvent('message.sent', { messageId: message.id, threadId: thread.id, postId: thread.post_id, senderId: req.user.id, senderName: req.user.name, recipientId, link: `/mensagens/ana?thread=${thread.id}` }, req.correlationId, sentAt);
     }
     persistDb();
 
@@ -2035,15 +2688,24 @@ async function start() {
   });
 
   app.get('/api/notifications', authMiddleware, async (req, res) => {
-    const localNotifications = all('SELECT id, type, title, text, link, created_at AS createdAt, read_at AS readAt FROM notifications WHERE user_id = ? ORDER BY created_at DESC LIMIT 50', [req.user.id]);
-    const distributed = await distributedServiceValue(NOTIFICATION_SERVICE_URL, `/notifications/${encodeURIComponent(req.user.id)}`);
-    const remoteNotifications = (distributed?.notifications || []).map((item) => ({ ...item, createdAt: item.createdAt || item.created_at, readAt: item.readAt || item.read_at || null }));
-    const notifications = [...localNotifications, ...remoteNotifications].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt)).slice(0, 50);
+    const notifications = await notificationsForUser(req.user.id);
     res.json({ notifications, unreadCount: notifications.filter((notification) => !notification.readAt).length });
   });
 
   app.post('/api/notifications/read', authMiddleware, (req, res) => {
     run('UPDATE notifications SET read_at = ? WHERE user_id = ? AND read_at IS NULL', [new Date().toISOString(), req.user.id]);
+    persistDb();
+    res.json({ ok: true });
+  });
+
+  app.post('/api/notifications/read-thread/:threadId', authMiddleware, (req, res) => {
+    const thread = get('SELECT id, participants_json FROM threads WHERE id = ?', [req.params.threadId]);
+    if (!thread) return res.status(404).json({ error: 'Thread not found' });
+    if (!JSON.parse(thread.participants_json || '[]').includes(req.user.id)) {
+      return res.status(403).json({ error: 'Thread access denied' });
+    }
+    const link = messageNoticeLink(thread.id);
+    run("UPDATE notifications SET read_at = ? WHERE user_id = ? AND type = 'message' AND read_at IS NULL AND link = ?", [new Date().toISOString(), req.user.id, link]);
     persistDb();
     res.json({ ok: true });
   });
@@ -2129,7 +2791,7 @@ async function start() {
   });
 
   app.get('/api/profile', authMiddleware, (req, res) => {
-    const posts = all('SELECT * FROM posts WHERE author_id = ?', [req.user.id]);
+    const posts = all("SELECT * FROM posts WHERE author_id = ? AND status <> 'Encerrado'", [req.user.id]);
     const impact = impactForUser(req.user.id);
     const reputation = get('SELECT ROUND(AVG(rating), 1) AS average, COUNT(*) AS count FROM reviews WHERE reviewee_id = ?', [req.user.id]);
     const reviews = all('SELECT reviews.id, reviews.rating, reviews.comment, reviews.created_at, users.name AS reviewer_name FROM reviews JOIN users ON users.id = reviews.reviewer_id WHERE reviews.reviewee_id = ? ORDER BY reviews.created_at DESC LIMIT 10', [req.user.id]);
@@ -2215,6 +2877,7 @@ async function start() {
       run('DELETE FROM comments WHERE post_id = ?', [postId]);
       run('DELETE FROM reports WHERE target_type = ? AND target_id = ?', ['post', postId]);
       run('DELETE FROM negotiations WHERE post_id = ?', [postId]);
+      run('DELETE FROM post_videos WHERE post_id = ?', [postId]);
       run('DELETE FROM posts WHERE id = ?', [postId]);
     });
     run('DELETE FROM favorites WHERE user_id = ?', [req.user.id]);
@@ -2235,14 +2898,14 @@ async function start() {
     const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     const totalUsers = get('SELECT COUNT(*) AS count FROM users')?.count || 0;
     const activeUsers = get('SELECT COUNT(*) AS count FROM users WHERE suspended = 0 AND last_active_at >= ?', [since])?.count || 0;
-    const totalPosts = get('SELECT COUNT(*) AS count FROM posts')?.count || 0;
+    const totalPosts = get("SELECT COUNT(*) AS count FROM posts WHERE status <> 'Encerrado'")?.count || 0;
     const activePosts = get("SELECT COUNT(*) AS count FROM posts WHERE status IN ('Disponível', 'Reservado')")?.count || 0;
     const donations = get("SELECT COUNT(*) AS count FROM posts WHERE status = 'Doado'")?.count || 0;
     const exchanges = get("SELECT COUNT(*) AS count FROM posts WHERE status = 'Trocado'")?.count || 0;
     const collectionPoints = get('SELECT COUNT(*) AS count FROM collection_points')?.count || 0;
     const reports = get("SELECT COUNT(*) AS count FROM reports WHERE status = 'pending'")?.count || 0;
     const newUsers = get('SELECT COUNT(*) AS count FROM users WHERE last_active_at >= ?', [since])?.count || 0;
-    const categories = all('SELECT category, COUNT(*) AS count FROM posts GROUP BY category ORDER BY count DESC LIMIT 8');
+    const categories = all("SELECT category, COUNT(*) AS count FROM posts WHERE status <> 'Encerrado' GROUP BY category ORDER BY count DESC LIMIT 8");
     return res.json({ totals: { totalUsers, activeUsers, totalPosts, activePosts, donations, exchanges, collectionPoints, reports, newUsers }, categories, impact: await communityImpact() });
   });
 
@@ -2262,14 +2925,62 @@ async function start() {
     return res.json({ suspended });
   });
 
+  app.delete('/api/admin/users/:id', authMiddleware, adminMiddleware, (req, res) => {
+    if (req.params.id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account' });
+    const user = get('SELECT id FROM users WHERE id = ?', [req.params.id]);
+    if (!user) return res.status(404).json({ error: 'User not found' });
+    const postIds = all('SELECT id FROM posts WHERE author_id = ?', [user.id]).map((item) => item.id);
+    const negotiationIds = all('SELECT id FROM negotiations WHERE owner_id = ? OR interested_id = ? OR post_id IN (SELECT id FROM posts WHERE author_id = ?)', [user.id, user.id, user.id]).map((item) => item.id);
+    if (negotiationIds.some((id) => get('SELECT id FROM payments WHERE negotiation_id = ? LIMIT 1', [id]))) {
+      return res.status(409).json({ error: 'Este usuário possui pagamentos vinculados e não pode ser excluído para preservar o histórico financeiro.' });
+    }
+    postIds.forEach((postId) => {
+      run('DELETE FROM delivery_incidents WHERE delivery_id IN (SELECT id FROM collection_deliveries WHERE negotiation_id IN (SELECT id FROM negotiations WHERE post_id = ?))', [postId]);
+      run('DELETE FROM collection_deliveries WHERE negotiation_id IN (SELECT id FROM negotiations WHERE post_id = ?)', [postId]);
+      run('DELETE FROM messages WHERE thread_id IN (SELECT id FROM threads WHERE post_id = ?)', [postId]);
+      run('DELETE FROM threads WHERE post_id = ?', [postId]);
+      run('DELETE FROM post_images WHERE post_id = ?', [postId]);
+      run('DELETE FROM favorites WHERE post_id = ?', [postId]);
+      run('DELETE FROM post_views WHERE post_id = ?', [postId]);
+      run('DELETE FROM post_likes WHERE post_id = ?', [postId]);
+      run('DELETE FROM comments WHERE post_id = ?', [postId]);
+      run('DELETE FROM reports WHERE target_type = ? AND target_id = ?', ['post', postId]);
+    });
+    run('DELETE FROM messages WHERE sender_id = ?', [user.id]);
+    run('DELETE FROM reviews WHERE reviewer_id = ? OR reviewee_id = ?', [user.id, user.id]);
+    if (negotiationIds.length) {
+      run('DELETE FROM reviews WHERE negotiation_id IN (' + negotiationIds.map(() => '?').join(',') + ')', negotiationIds);
+      run('DELETE FROM negotiations WHERE id IN (' + negotiationIds.map(() => '?').join(',') + ')', negotiationIds);
+    }
+    run('DELETE FROM post_videos WHERE post_id IN (SELECT id FROM posts WHERE author_id = ?)', [user.id]);
+    run('DELETE FROM posts WHERE author_id = ?', [user.id]);
+    run('DELETE FROM favorites WHERE user_id = ?', [user.id]);
+    run('DELETE FROM post_views WHERE user_id = ?', [user.id]);
+    run('DELETE FROM post_likes WHERE user_id = ?', [user.id]);
+    run('DELETE FROM reports WHERE reporter_id = ?', [user.id]);
+    run('DELETE FROM blocked_users WHERE blocker_id = ? OR blocked_id = ?', [user.id, user.id]);
+    run('DELETE FROM notifications WHERE user_id = ?', [user.id]);
+    run('DELETE FROM collection_point_suggestions WHERE user_id = ?', [user.id]);
+    run('DELETE FROM users WHERE id = ?', [user.id]);
+    persistDb();
+    return res.json({ ok: true });
+  });
+
   app.get('/api/admin/posts', authMiddleware, adminMiddleware, (_req, res) => {
-    const rows = all('SELECT * FROM posts ORDER BY created_at DESC LIMIT 200');
+    const rows = all("SELECT * FROM posts WHERE status <> 'Encerrado' ORDER BY created_at DESC LIMIT 200");
     return res.json({ posts: rows.map((row) => publicPost(row)) });
   });
 
   app.delete('/api/admin/posts/:id', authMiddleware, adminMiddleware, (req, res) => {
     const post = get('SELECT id FROM posts WHERE id = ?', [req.params.id]);
     if (!post) return res.status(404).json({ error: 'Post not found' });
+    if (get('SELECT id FROM payments p JOIN negotiations n ON n.id = p.negotiation_id WHERE n.post_id = ? LIMIT 1', [post.id])) {
+      run("UPDATE posts SET status = 'Encerrado', reserved_by = NULL, updated_at = ? WHERE id = ?", [new Date().toISOString(), post.id]);
+      run('DELETE FROM favorites WHERE post_id = ?', [post.id]);
+      run('DELETE FROM reports WHERE target_type = ? AND target_id = ?', ['post', post.id]);
+      persistDb();
+      return res.json({ ok: true, archived: true });
+    }
     run('DELETE FROM favorites WHERE post_id = ?', [post.id]);
     run('DELETE FROM post_views WHERE post_id = ?', [post.id]);
     run('DELETE FROM post_likes WHERE post_id = ?', [post.id]);
@@ -2278,6 +2989,7 @@ async function start() {
     negotiationIds.forEach((id) => run('DELETE FROM reviews WHERE negotiation_id = ?', [id]));
     run('DELETE FROM negotiations WHERE post_id = ?', [post.id]);
     run('DELETE FROM reports WHERE target_type = ? AND target_id = ?', ['post', post.id]);
+    run('DELETE FROM post_videos WHERE post_id = ?', [post.id]);
     run('DELETE FROM posts WHERE id = ?', [post.id]);
     persistDb();
     return res.json({ ok: true });
@@ -2322,20 +3034,27 @@ async function start() {
     }
   });
 
-  app.patch('/api/admin/collection-points/:id', authMiddleware, adminMiddleware, (req, res) => {
+  app.patch('/api/admin/collection-points/:id', authMiddleware, adminMiddleware, async (req, res, next) => {
     const current = get('SELECT * FROM collection_points WHERE id = ?', [req.params.id]);
     if (!current) return res.status(404).json({ error: 'Collection point not found' });
-    const name = String(req.body?.name ?? current.name).trim();
-    const location = String(req.body?.location ?? current.location).trim();
-    const hours = String(req.body?.hours ?? current.hours).trim();
-    const categories = Array.isArray(req.body?.categories) ? req.body.categories.map((item) => String(item).trim()).filter(Boolean).slice(0, 30) : jsonArray(current.categories_json);
+    const body = req.body || {};
+    const name = String(body.name ?? current.name).trim();
+    const address = buildCollectionPointAddress({ ...body, location: body.location ?? current.location });
+    const location = address.location;
+    const hours = String(body.hours ?? current.hours).trim();
+    const categories = Array.isArray(body.categories) ? body.categories.map((item) => String(item).trim()).filter(Boolean).slice(0, 30) : jsonArray(current.categories_json);
     if (!name || !location || name.length > 160 || location.length > 240 || hours.length > 160) return res.status(400).json({ error: 'Name and location are required' });
-    const latitude = req.body?.latitude === undefined ? current.latitude : Number.isFinite(Number(req.body.latitude)) ? Number(req.body.latitude) : null;
-    const longitude = req.body?.longitude === undefined ? current.longitude : Number.isFinite(Number(req.body.longitude)) ? Number(req.body.longitude) : null;
-    const updatedAt = new Date().toISOString();
-    run('UPDATE collection_points SET name = ?, categories_json = ?, hours = ?, location = ?, status = ?, origin = ?, last_updated = ?, latitude = ?, longitude = ? WHERE id = ?', [name, JSON.stringify(categories), hours, location, String(req.body?.status ?? current.status).trim(), String(req.body?.origin ?? current.origin).trim(), updatedAt, latitude, longitude, current.id]);
-    persistDb();
-    return res.json({ point: { id: current.id, name, categories, hours, location, status: String(req.body?.status ?? current.status).trim(), origin: String(req.body?.origin ?? current.origin).trim(), lastUpdated: updatedAt, latitude, longitude } });
+    try {
+      const geocoded = await geocodeCollectionPoint(address);
+      const latitude = body.latitude === undefined ? geocoded?.latitude ?? current.latitude : Number.isFinite(Number(body.latitude)) ? Number(body.latitude) : null;
+      const longitude = body.longitude === undefined ? geocoded?.longitude ?? current.longitude : Number.isFinite(Number(body.longitude)) ? Number(body.longitude) : null;
+      const updatedAt = new Date().toISOString();
+      run('UPDATE collection_points SET name = ?, categories_json = ?, hours = ?, location = ?, status = ?, origin = ?, last_updated = ?, latitude = ?, longitude = ? WHERE id = ?', [name, JSON.stringify(categories), hours, location, String(body.status ?? current.status).trim(), String(body.origin ?? current.origin).trim(), updatedAt, latitude, longitude, current.id]);
+      persistDb();
+      return res.json({ point: { id: current.id, name, categories, hours, location, status: String(body.status ?? current.status).trim(), origin: String(body.origin ?? current.origin).trim(), lastUpdated: updatedAt, latitude, longitude } });
+    } catch (error) {
+      return next(error);
+    }
   });
 
   app.delete('/api/admin/collection-points/:id', authMiddleware, adminMiddleware, (req, res) => {
@@ -2373,8 +3092,19 @@ async function start() {
       return res.status(400).json({ error: error.message });
     }
     if (req.path.startsWith('/api/')) {
-      console.error(error);
-      return res.status(500).json({ error: 'Internal server error' });
+      const requestId = req.correlationId || uid('request');
+      console.error(`[api-error] ${requestId} ${req.method} ${req.originalUrl}:`, error);
+      const status = Number(error?.status);
+      if (Number.isInteger(status) && status >= 400 && status < 500) {
+        const safePaymentErrors = {
+          'Payment must use the accepted proposal amount and method': 'O valor ou a forma de pagamento não coincide com a proposta aceita.',
+          'The idempotency key was already used with different payment data': 'Esta tentativa de pagamento já foi utilizada com dados diferentes.',
+          'This negotiation already has a successful payment': 'Esta negociação já possui um pagamento concluído.'
+        };
+        const message = safePaymentErrors[error?.message];
+        if (message) return res.status(status).json({ error: message, requestId });
+      }
+      return res.status(500).json({ error: 'Internal server error', requestId });
     }
     return next(error);
   });

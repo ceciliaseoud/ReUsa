@@ -1,13 +1,40 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import {AlertsPage,NeedsPage,FeedLocationFilters,Questions,TransportPanel,TransportFields} from './components/CommunityTools';
+import NegotiationsPage from './components/NegotiationsPage';
+import DeliveryCard from './components/DeliveryCard';
+import StripeConnectionCard from './components/StripeConnectionCard';
+import { stripeConnectionState } from './services/stripe-connection-state.mjs';
+import CampaignCreateForm from './components/CampaignCreateForm';
+import CampaignFeed from './components/CampaignFeed';
+import PostMediaPicker from './components/PostMediaPicker';
+import PostMediaGallery from './components/PostMediaGallery';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { Navigate, useLocation, useNavigate } from 'react-router-dom';
 import { api, clearToken, setToken } from './services/api';
 import { useAppStore } from './state/store';
 import { fallbackPosts } from './data/fallback-posts';
-import { CircleMarker, MapContainer, TileLayer, useMap } from 'react-leaflet';
+import { CircleMarker, MapContainer, Marker, Polyline, TileLayer, Tooltip, useMap, useMapEvents } from 'react-leaflet';
+import { divIcon } from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import feedLogo from './assets/reusa-logo.png';
 
 const BRAZIL_TIME_ZONE = 'America/Sao_Paulo';
+const postMediaItems = (post) => [
+  ...(Array.isArray(post.imageUrls) ? post.imageUrls : post.imageUrl && post.imageUrl !== '/media/video-placeholder.svg' ? [post.imageUrl] : []).map((url) => ({ url, kind: 'image' })),
+  ...(post.videos || []).map((video) => ({ url: video.url, mimeType: video.mimeType, kind: 'video' }))
+];
+const isValidEmailFormat = (value) => {
+  const email = String(value || '').trim();
+  if (email.length > 254 || email.includes('..')) return false;
+  const match = email.match(/^([^@\s]+)@([^@\s]+)$/);
+  if (!match) return false;
+  const [, localPart, domain] = match;
+  if (localPart.length > 64 || localPart.startsWith('.') || localPart.endsWith('.')) return false;
+  const labels = domain.split('.');
+  return labels.length >= 2
+    && labels.every((label) => label.length >= 1 && label.length <= 63 && !label.startsWith('-') && !label.endsWith('-') && /^[a-zA-Z0-9-]+$/.test(label))
+    && labels.at(-1).length >= 2;
+};
 const validDate = (value) => {
   const date = new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
@@ -20,6 +47,52 @@ const formatBrazilDate = (value) => {
   const date = validDate(value);
   return date ? new Intl.DateTimeFormat('pt-BR', { timeZone: BRAZIL_TIME_ZONE, day: '2-digit', month: '2-digit', year: 'numeric' }).format(date) : '--/--/----';
 };
+const formatRelativeTime = (value, now = Date.now()) => {
+  const timestamp = validDate(value)?.getTime();
+  if (!timestamp) return 'Data desconhecida';
+  const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+  if (seconds < 60) return 'Há alguns segundos';
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `Há ${minutes} minuto${minutes === 1 ? '' : 's'}`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `Há ${hours} hora${hours === 1 ? '' : 's'}`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `Há ${days} dia${days === 1 ? '' : 's'}`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `Há ${months} mês${months === 1 ? '' : 'es'}`;
+  const years = Math.floor(months / 12);
+  return `Há ${years} ano${years === 1 ? '' : 's'}`;
+};
+const formatMoneyInput = (value) => {
+  const digits = String(value || '').replace(/\D/g, '');
+  if (!digits) return '';
+  return (Number(digits) / 100).toLocaleString('pt-BR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+};
+const negotiationStatusLabel = (status) => ({
+  interested: 'Pendente',
+  reserved: 'Reservado',
+  completed: 'Concluído',
+  cancelled: 'Cancelado'
+}[status] || 'Pendente');
+const proposalStatusLabel = (status) => ({
+  pending: 'Pendente',
+  accepted: 'Aceita',
+  rejected: 'Recusada',
+  cancelled: 'Cancelada'
+}[status] || status);
+function showBrowserNotification(notification) {
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+  const browserNotification = new Notification(notification.title, {
+    body: notification.text,
+    tag: notification.id,
+    icon: feedLogo
+  });
+  browserNotification.onclick = () => {
+    window.focus();
+    if (notification.link) window.location.assign(notification.link);
+    browserNotification.close();
+  };
+}
 
 const navRoutes = {
   home: '/feed',
@@ -35,6 +108,35 @@ const navRoutes = {
   inspiracoes: '/inspiracoes'
 };
 
+const collectionPointMarkerIcon = (selected = false) => divIcon({
+  className: selected ? 'collection-point-marker is-selected' : 'collection-point-marker',
+  html: '<span class="collection-point-marker-symbol material-symbols-outlined" aria-hidden="true">recycling</span>',
+  iconSize: [20, 20],
+  iconAnchor: [10, 10],
+  tooltipAnchor: [0, -14]
+});
+
+function formatRouteDistance(distance) {
+  const meters = Number(distance);
+  if (!Number.isFinite(meters)) return '';
+  return meters >= 1000 ? `${(meters / 1000).toLocaleString('pt-BR', { maximumFractionDigits: 1 })} km` : `${Math.round(meters)} m`;
+}
+
+function formatRouteDuration(duration) {
+  const minutes = Math.max(1, Math.round(Number(duration) / 60));
+  if (!Number.isFinite(minutes)) return '';
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const remainingMinutes = minutes % 60;
+  return remainingMinutes ? `${hours} h ${remainingMinutes} min` : `${hours} h`;
+}
+
+function finiteCoordinate(value) {
+  if (value === null || value === undefined || (typeof value === 'string' && !value.trim())) return null;
+  const coordinate = Number(value);
+  return Number.isFinite(coordinate) ? coordinate : null;
+}
+
 export function AppRoutes() {
   const location = useLocation();
   const navigate = useNavigate();
@@ -47,11 +149,11 @@ export function AppRoutes() {
   }, [initialize]);
 
   useEffect(() => {
-    const publicRoute = ['/splash', '/login', '/criar-conta', '/feed', '/mapa', '/inspiracoes', '/mensagens', '/mensagens/ana', '/nova-publicacao', '/perfil', '/sobre'].includes(location.pathname) || location.pathname.startsWith('/anuncios/');
-    if (!session && !publicRoute) {
+    const publicRoute = ['/splash', '/login', '/recuperar-senha', '/redefinir-senha', '/criar-conta', '/pedidos', '/feed', '/mapa', '/inspiracoes', '/mensagens', '/mensagens/ana', '/nova-publicacao', '/perfil', '/sobre'].includes(location.pathname) || location.pathname.startsWith('/anuncios/');
+    if (initialized && !session && !publicRoute) {
       navigate('/login', { replace: true });
     }
-  }, [session, location.pathname, navigate]);
+  }, [initialized, session, location.pathname, navigate]);
 
   if (!initialized) return <div className="loading-stage"><span className="material-symbols-outlined">recycling</span><p>Carregando seu espaço...</p></div>;
   return <ScreenErrorBoundary><ScreenRouter location={location.pathname} navigate={navigate} /></ScreenErrorBoundary>;
@@ -87,11 +189,15 @@ function ScreenRouter({ location, navigate }) {
     case '/':
       return <Navigate to="/splash" replace />;
     case '/splash':
-      return <LandingScreen onCreateAccount={() => navigate('/criar-conta')} onLogin={() => navigate('/login')} onExplore={() => navigate('/feed')} onAbout={() => navigate('/sobre')} />;
+      return <LandingScreen onCreateAccount={() => navigate('/criar-conta')} onLogin={() => navigate('/login')} onAbout={() => navigate('/sobre')} />;
     case '/onboarding':
       return <Navigate to="/login" replace />;
     case '/login':
       return <LoginScreen onGoToRegister={() => navigate('/criar-conta')} onSuccess={() => navigate('/feed')} />;
+    case '/recuperar-senha':
+      return <ForgotPasswordScreen onBack={() => navigate('/login')} />;
+    case '/redefinir-senha':
+      return <ResetPasswordScreen onBack={() => navigate('/login')} onSuccess={() => navigate('/login')} />;
     case '/criar-conta':
       return <RegisterScreen onGoToLogin={() => navigate('/login')} onSuccess={() => navigate('/feed')} />;
     case '/feed':
@@ -105,13 +211,21 @@ function ScreenRouter({ location, navigate }) {
     case '/notificacoes':
       return <NotificationsScreen onBack={() => navigate('/feed')} onNavigate={navigate} />;
     case '/mensagens':
-      return <MessagesScreen onOpenThread={(threadId) => navigate(`/mensagens/ana?thread=${threadId || 'thread-ana-notebook'}`)} />;
+      return <MessagesScreen onOpenThread={(threadId) => threadId && navigate(`/mensagens/ana?thread=${threadId}`)} />;
     case '/mensagens/ana':
       return <ChatScreen onBack={() => navigate('/mensagens')} />;
+    case '/alertas':
+      return <div className="post-screen community-screen"><UnifiedTopbar onBack={()=>navigate('/feed')}/><AlertsPage/></div>;
+    case '/pedidos':
+      return <div className="post-screen community-screen"><UnifiedTopbar onBack={()=>navigate('/feed')}/><NeedsPage session={useAppStore.getState().session} onNavigate={navigate}/></div>;
+    case '/negociacoes':
+      return <div className="post-screen negotiations-screen"><UnifiedTopbar onBack={() => navigate('/feed')} /><NegotiationsPage onNavigate={navigate} /></div>;
+    case '/nova-campanha':
+      return <CreateCampaignScreen onBack={() => navigate('/feed')} onSuccess={() => navigate('/feed')} />;
     case '/nova-publicacao':
       return <CreatePostScreen onBack={() => navigate('/feed')} onSuccess={() => navigate('/feed')} />;
     case '/perfil':
-      return <ProfileScreen onGoToFeed={() => navigate('/feed')} onSettings={() => navigate('/configuracoes')} onSaved={() => navigate('/itens-salvos')} onMyPosts={() => navigate('/meus-anuncios')} onAdmin={() => navigate('/admin')} />;
+      return <ProfileScreen onGoToFeed={() => navigate('/feed')} onSettings={() => navigate('/configuracoes')} onOpenPost={(id) => navigate(`/anuncios/${id}`)} onAdmin={() => navigate('/admin')} />;
     case '/mapa':
       return <MapScreen onSuggest={() => navigate('/sugerir-ponto')} />;
     case '/itens-salvos':
@@ -159,12 +273,12 @@ function BottomNav({ nav, active }) {
           <a
             key={key}
             href={to}
-            className={isAdd ? 'nav-item nav-add' : isActive ? 'nav-item nav-active' : 'nav-item'}
+            className={`nav-item${isAdd ? ' nav-add' : ''}${isActive ? ' nav-active' : ''}`}
             aria-current={isActive ? 'page' : undefined}
             aria-label={label}
           >
-            <span className="nav-icon-wrap"><span className="material-symbols-outlined">{icon}</span>{key === 'mensagens' && unreadMessages ? <b className="nav-badge">{unreadMessages}</b> : null}</span>
-            <span>{label}</span>
+            <span className={`nav-icon-wrap${isAdd ? ' nav-add-icon' : ''}`}><span className="material-symbols-outlined">{icon}</span>{key === 'mensagens' && unreadMessages ? <b className="nav-badge">{unreadMessages}</b> : null}</span>
+            <span className={isAdd ? 'nav-add-label' : undefined}>{label}</span>
           </a>
         );
       })}
@@ -172,11 +286,13 @@ function BottomNav({ nav, active }) {
   );
 }
 
-function UnifiedTopbar({ title, onBack, action, brandHref = '/feed' }) {
+function UnifiedTopbar({ onBack, action, brandHref = '/feed' }) {
   return <header className="topbar unified-topbar">
-    <a className="brand unified-brand" href={brandHref} aria-label="ReUsa+, início"><img src={feedLogo} alt="" /><span>ReUsa+</span></a>
-    {title ? <h1>{title}</h1> : <span aria-hidden="true" />}
-    <div className="unified-topbar-action">{action || (onBack ? <button className="back-btn" onClick={onBack} aria-label="Voltar"><span className="material-symbols-outlined">arrow_back</span></button> : <HeaderProfileButton />)}</div>
+    <div className="unified-topbar-leading">
+      {onBack ? <button className="back-btn" onClick={onBack} aria-label="Voltar"><span className="material-symbols-outlined">arrow_back</span></button> : null}
+      <a className="brand unified-brand" href={brandHref} aria-label="ReUsa+, início"><img src={feedLogo} alt="ReUsa+" /><span>ReUsa+</span></a>
+    </div>
+    <div className="unified-topbar-action">{action || <HeaderProfileButton />}</div>
   </header>;
 }
 
@@ -185,20 +301,47 @@ function HeaderProfileButton() {
   return <a className="avatar-btn header-profile-btn" href="/perfil" aria-label="Abrir perfil">{session?.avatar ? <img src={session.avatar} alt="" /> : <span className="material-symbols-outlined">person</span>}</a>;
 }
 
-function LandingScreen({ onCreateAccount, onLogin, onExplore, onAbout }) {
+function ModalPortal({ children }) {
+  return createPortal(children, document.body);
+}
+
+function LandingScreen({ onCreateAccount, onLogin, onAbout }) {
   const [featuredPosts, setFeaturedPosts] = useState([]);
   const [postsLoading, setPostsLoading] = useState(true);
+  const featuredPostsCursor = useRef(0);
+  const featuredPostsRequest = useRef(false);
+
+  const loadFeaturedPosts = useCallback(async (showLoading = true) => {
+    if (featuredPostsRequest.current) return;
+    featuredPostsRequest.current = true;
+    if (showLoading) setPostsLoading(true);
+    try {
+      const result = await api.feed();
+      const availablePosts = (result.posts || []).filter((post) => post.status === 'Disponível');
+      if (!availablePosts.length) {
+        featuredPostsCursor.current = 0;
+        setFeaturedPosts([]);
+        return;
+      }
+
+      const cardsToShow = Math.min(2, availablePosts.length);
+      const start = featuredPostsCursor.current % availablePosts.length;
+      const nextPosts = Array.from({ length: cardsToShow }, (_value, index) => availablePosts[(start + index) % availablePosts.length]);
+      featuredPostsCursor.current = (start + cardsToShow) % availablePosts.length;
+      setFeaturedPosts(nextPosts);
+    } catch (error) {
+      console.error('Não foi possível atualizar os anúncios da splash', error);
+    } finally {
+      setPostsLoading(false);
+      featuredPostsRequest.current = false;
+    }
+  }, []);
 
   useEffect(() => {
-    let active = true;
-    api.feed()
-      .then((result) => {
-        if (active) setFeaturedPosts((result.posts || []).filter((post) => post.status === 'Disponível').slice(0, 2));
-      })
-      .catch(() => { if (active) setFeaturedPosts([]); })
-      .finally(() => { if (active) setPostsLoading(false); });
-    return () => { active = false; };
-  }, []);
+    loadFeaturedPosts(false);
+    const rotation = window.setInterval(() => loadFeaturedPosts(false), 60_000);
+    return () => window.clearInterval(rotation);
+  }, [loadFeaturedPosts]);
 
   return (
     <main className="landing-screen">
@@ -207,22 +350,21 @@ function LandingScreen({ onCreateAccount, onLogin, onExplore, onAbout }) {
         <div className="landing-account-actions"><button className="landing-login" onClick={onLogin}>Fazer login</button><button className="landing-start" onClick={onCreateAccount}>Começar agora</button></div>
       </header>
       <section className="landing-hero" id="como-funciona">
-        <div className="landing-copy"><img className="landing-hero-logo" src={feedLogo} alt="REUSA+" /><h1>Você desapega. Uma nova história começa.</h1><p>Na REUSA+, o que você não usa ganha um novo destino e novas possibilidades.</p></div>
+        <div className="landing-copy"><img className="landing-hero-logo" src={feedLogo} alt="REUSA+" /><h1>Dê novos caminhos <span>ao que ainda tem valor.</span></h1><p>Na REUSA+, o que você não usa ganha um novo destino e novas possibilidades.</p></div>
         <div className="landing-flow" id="categorias" aria-label="Exemplo de um item ganhando novo ciclo">
           <article className="listing-card listing-card-one"><div className="listing-photo chair-photo"><span>Doação</span></div><div className="listing-content"><small><i />Disponível agora</small><h2>Cadeira Escandinava</h2><p>Madeira nobre · Pinheiros, SP</p><footer>Por Mariana R. <b>Grátis</b></footer></div></article>
-          {postsLoading ? <div className="landing-listings-loading"><span className="material-symbols-outlined">progress_activity</span>Carregando anúncios...</div> : featuredPosts.length ? <div className="landing-listings">{featuredPosts.map((post, index) => <React.Fragment key={post.id}><article className={`listing-card ${index === 0 ? 'listing-card-one' : 'listing-card-two'}`}><div className="listing-photo"><img src={post.imageUrl} alt={post.title} /><span>{post.goal || 'Anúncio'}</span></div><div className="listing-content"><small><i />Disponível agora</small><h2>{post.title}</h2><p>{post.category} · {post.location}</p><footer>Por {post.author?.name || 'Membro da comunidade'} <b>{post.goal || 'Grátis'}</b></footer></div></article>{index === 0 && featuredPosts.length > 1 ? <div className="landing-cycle"><span className="material-symbols-outlined">sync</span></div> : null}</React.Fragment>)}</div> : <div className="landing-listings-empty"><span className="material-symbols-outlined">inventory_2</span><strong>A comunidade ainda não publicou anúncios.</strong><small>Seja a primeira pessoa a dar um novo ciclo a um item.</small></div>}
-          <div className="landing-cycle landing-cycle-legacy"><span className="material-symbols-outlined">sync</span></div>
+          {postsLoading ? <div className="landing-listings-loading"><span className="material-symbols-outlined">progress_activity</span>Carregando anúncios...</div> : featuredPosts.length ? <div className="landing-listings">{featuredPosts.map((post, index) => <React.Fragment key={post.id}><article className={`listing-card ${index === 0 ? 'listing-card-one' : 'listing-card-two'}`}><div className="listing-photo"><img src={post.imageUrl} alt={post.title} /><span>{post.goal || 'Anúncio'}</span></div><div className="listing-content"><small><i />Disponível agora</small><h2>{post.title}</h2><p>{post.category} · {post.location}</p><footer>Por {post.author?.name || 'Membro da comunidade'} <b>{post.goal || 'Grátis'}</b></footer></div></article>{index === 0 && featuredPosts.length > 1 ? <button type="button" className="landing-cycle" onClick={() => loadFeaturedPosts()} disabled={postsLoading} aria-label="Atualizar anúncios exibidos"><span className="material-symbols-outlined">sync</span></button> : null}</React.Fragment>)}</div> : <div className="landing-listings-empty"><span className="material-symbols-outlined">inventory_2</span><strong>A comunidade ainda não publicou anúncios.</strong><small>Seja a primeira pessoa a dar um novo ciclo a um item.</small></div>}
           <article className="listing-card listing-card-two"><div className="listing-photo plant-photo"><span>Recebido</span></div><div className="listing-content"><small><i />Novo lar encontrado</small><h2>Monstera com Cachepot</h2><p>Planta viva · Vila Mariana, SP</p><footer>Adotado por Lucas T. <b>Com carinho</b></footer></div></article>
           <div className="landing-steps"><div><span className="material-symbols-outlined">add_box</span><strong>Publique</strong><small>o que não usa</small></div><div><span className="material-symbols-outlined">forum</span><strong>Converse</strong><small>com interessados</small></div><div><span className="material-symbols-outlined">group</span><strong>Transforme</strong><small>o descarte</small></div></div>
-          <div className="landing-conversion"><button onClick={onCreateAccount}>Criar minha conta <span className="material-symbols-outlined">arrow_forward</span></button><button onClick={onExplore}><span className="material-symbols-outlined">search</span>Explorar anúncios sem entrar</button></div>
+          <div className="landing-conversion"><button onClick={onCreateAccount}>Criar minha conta</button></div>
         </div>
       </section>
-      <footer className="landing-footer"><p>© 2025 REUSA+. Economia sustentável feita por pessoas.</p><div><a href="#termos">Termos de uso</a><a href="#privacidade">Política de privacidade</a><a href="#ajuda">Central de ajuda</a></div></footer>
+      <footer className="landing-footer"><p>© 2026 REUSA+. Economia sustentável feita por pessoas.</p><div><span>Termos de uso</span><span>Política de privacidade</span><span>Central de ajuda</span></div></footer>
     </main>
   );
 }
 
-function SplashScreen({ onCreateAccount, onLogin, onExplore, onAbout }) {
+function SplashScreen({ onCreateAccount, onLogin, onAbout }) {
   return (
     <main className="welcome-screen">
       <div className="welcome-glow welcome-glow-one" />
@@ -255,7 +397,6 @@ function SplashScreen({ onCreateAccount, onLogin, onExplore, onAbout }) {
 
       <section className="welcome-actions">
         <button className="primary-btn full welcome-main-action" onClick={onCreateAccount}>Criar minha conta <span className="material-symbols-outlined">arrow_forward</span></button>
-        <button className="welcome-explore" onClick={onExplore}><span className="material-symbols-outlined">travel_explore</span> Explorar anúncios sem entrar</button>
         <p>Já faz parte da comunidade? <button className="text-btn" onClick={onLogin}>Fazer login</button></p>
       </section>
 
@@ -272,6 +413,7 @@ function LoginScreen({ onGoToRegister, onSuccess }) {
     const fragment = new URLSearchParams(window.location.hash.replace(/^#/, ''));
     const token = fragment.get('reusa_token');
     const error = fragment.get('auth_error');
+    if (fragment.get('email_verified') === '1') alert('E-mail confirmado. Agora você já pode entrar.');
     if (!token && !error) return;
 
     window.history.replaceState({}, '', `${window.location.pathname}${window.location.search}`);
@@ -319,6 +461,7 @@ function LoginScreen({ onGoToRegister, onSuccess }) {
         <form onSubmit={submit} className="auth-form">
           <Field label="E-mail" icon="mail" value={formState.email} onChange={(value) => setFormState((prev) => ({ ...prev, email: value }))} placeholder="seu@email.com" />
           <Field label="Senha" icon="lock" type="password" value={formState.password} onChange={(value) => setFormState((prev) => ({ ...prev, password: value }))} placeholder="••••••••" />
+          <div className="auth-form-link"><button type="button" className="text-btn" onClick={() => window.location.assign('/recuperar-senha')}>Esqueci minha senha</button></div>
           <button type="submit" className="primary-btn full">Entrar <span className="material-symbols-outlined">arrow_forward</span></button>
         </form>
         <GoogleSignInButton iconOnly />
@@ -328,20 +471,112 @@ function LoginScreen({ onGoToRegister, onSuccess }) {
   );
 }
 
+function ForgotPasswordScreen({ onBack }) {
+  const [email, setEmail] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState('');
+  const [error, setError] = useState('');
+
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true); setError(''); setMessage('');
+    try {
+      const result = await api.forgotPassword(email);
+      setMessage(result.message);
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally { setBusy(false); }
+  }
+
+  return <div className="auth-layout login-layout"><UnifiedTopbar brandHref="/splash" action={<button className="avatar-btn" onClick={onBack} aria-label="Voltar ao login"><span className="material-symbols-outlined">arrow_back</span></button>} /><div className="login-orb login-orb-one" /><div className="login-orb login-orb-two" /><div className="auth-card login-card"><div className="auth-logo"><img src={feedLogo} alt="REUSA+" /></div><h2>Esqueceu sua senha?</h2><p>Informe seu e-mail e enviaremos um link para criar uma nova senha.</p><form onSubmit={submit} className="auth-form"><Field label="E-mail" icon="mail" value={email} onChange={setEmail} placeholder="seu@email.com" type="email" required /><button type="submit" className="primary-btn full" disabled={busy}>{busy ? 'Enviando...' : 'Enviar link'} <span className="material-symbols-outlined">mail</span></button></form>{message ? <p className="auth-feedback auth-feedback-success" role="status">{message}</p> : null}{error ? <p className="auth-feedback auth-feedback-error" role="alert">{error}</p> : null}<div className="auth-footer"><button className="text-btn" onClick={onBack}>Voltar para o login</button></div></div></div>;
+}
+
+function ResetPasswordScreen({ onBack, onSuccess }) {
+  const token = new URLSearchParams(window.location.search).get('token') || '';
+  const [password, setPassword] = useState('');
+  const [confirmation, setConfirmation] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  async function submit(event) {
+    event.preventDefault();
+    if (password.length < 8) return setError('A senha precisa ter pelo menos 8 caracteres.');
+    if (password !== confirmation) return setError('As senhas não conferem.');
+    setBusy(true); setError('');
+    try {
+      await api.resetPassword(token, password);
+      alert('Senha redefinida com sucesso. Você já pode entrar.');
+      onSuccess();
+    } catch (requestError) {
+      setError(requestError.message);
+    } finally { setBusy(false); }
+  }
+
+  return <div className="auth-layout login-layout"><UnifiedTopbar brandHref="/splash" action={<button className="avatar-btn" onClick={onBack} aria-label="Voltar ao login"><span className="material-symbols-outlined">arrow_back</span></button>} /><div className="login-orb login-orb-one" /><div className="login-orb login-orb-two" /><div className="auth-card login-card"><div className="auth-logo"><img src={feedLogo} alt="REUSA+" /></div><h2>Crie uma nova senha</h2><p>Escolha uma senha com pelo menos 8 caracteres.</p><form onSubmit={submit} className="auth-form"><Field label="Nova senha" icon="lock" type="password" value={password} onChange={setPassword} placeholder="Mínimo 8 caracteres" required minLength={8} /><Field label="Confirme a senha" icon="lock_reset" type="password" value={confirmation} onChange={setConfirmation} placeholder="Digite novamente" required minLength={8} /><button type="submit" className="primary-btn full" disabled={busy}>{busy ? 'Salvando...' : 'Redefinir senha'} <span className="material-symbols-outlined">check</span></button></form>{error ? <p className="auth-feedback auth-feedback-error" role="alert">{error}</p> : null}<div className="auth-footer"><button className="text-btn" onClick={onBack}>Voltar para o login</button></div></div></div>;
+}
+
 function RegisterScreen({ onGoToLogin, onSuccess }) {
   const register = useAppStore((state) => state.register);
   const [formState, setFormState] = useState({ name: '', email: '', password: '', cep: '', address: '', city: '', neighborhood: '', accountType: 'person', businessName: '', cnpj: '', interests: [] });
   const [cepBusy, setCepBusy] = useState(false);
   const [cnpjBusy, setCnpjBusy] = useState(false);
   const [cnpjNotice, setCnpjNotice] = useState('');
+  const [emailNotice, setEmailNotice] = useState('');
 
   async function submit(event) {
     event.preventDefault();
+    const name = String(formState.name || '').trim();
+    const email = String(formState.email || '').trim();
+    const password = String(formState.password || '');
+    const city = String(formState.city || '').trim();
+
+    if (!name || !email || !password || !city) {
+      alert('Preencha nome, e-mail, senha e cidade para criar sua conta.');
+      return;
+    }
+    if (!isValidEmailFormat(email)) {
+      alert('Informe um e-mail válido, como nome@gmail.com, nome@outlook.com ou outro domínio existente.');
+      return;
+    }
+    if (password.length < 8) {
+      alert('A senha precisa ter pelo menos 8 caracteres.');
+      return;
+    }
+    if (formState.accountType === 'business' && (!String(formState.businessName || '').trim() || !String(formState.cnpj || '').trim())) {
+      alert('Informe a razão social e o CNPJ da empresa.');
+      return;
+    }
     try {
       await register(formState);
+      alert('Cadastro criado. Enviamos um link de confirmação para seu e-mail.');
       onSuccess();
     } catch (error) {
-      alert(error.message);
+      alert(error.message || 'Não foi possível criar sua conta. Tente novamente.');
+    }
+  }
+
+  async function lookupCnpj(value) {
+    const cnpj = value.replace(/\D/g, '').slice(0, 14);
+    setFormState((prev) => ({ ...prev, cnpj }));
+    setCnpjNotice('');
+    if (cnpj.length !== 14) return;
+    setCnpjBusy(true);
+    try {
+      const { business } = await api.businessByCnpj(cnpj);
+      setFormState((prev) => ({
+        ...prev,
+        cnpj,
+        businessName: business.legalName || business.tradeName || prev.businessName,
+        cep: business.cep || prev.cep,
+        address: business.address || prev.address,
+        neighborhood: business.neighborhood || prev.neighborhood,
+        city: business.city || prev.city
+      }));
+      setCnpjNotice(business.status ? `Dados preenchidos · ${business.status}` : 'Dados da empresa preenchidos.');
+    } catch (error) {
+      setCnpjNotice(error.message === 'CNPJ não encontrado.' ? 'CNPJ não encontrado. Preencha os dados manualmente.' : 'Não foi possível consultar agora. Você pode preencher manualmente.');
+    } finally {
+      setCnpjBusy(false);
     }
   }
 
@@ -354,7 +589,7 @@ function RegisterScreen({ onGoToLogin, onSuccess }) {
       const response = await fetch(`https://viacep.com.br/ws/${cep}/json/`);
       const address = await response.json();
       if (address.erro) throw new Error('CEP não encontrado');
-      setFormState((prev) => ({ ...prev, cep, city: `${address.localidade}${address.uf ? `, ${address.uf}` : ''}`, address: [address.logradouro, address.bairro].filter(Boolean).join(', ') }));
+      setFormState((prev) => ({ ...prev, cep, city: `${address.localidade}${address.uf ? `, ${address.uf}` : ''}`, neighborhood: address.bairro || prev.neighborhood, address: [address.logradouro, address.bairro].filter(Boolean).join(', ') }));
     } catch (error) {
       alert(error.message);
     } finally {
@@ -372,16 +607,19 @@ function RegisterScreen({ onGoToLogin, onSuccess }) {
           <h2>Faça o descarte<br /><em>virar recomeço.</em></h2>
           <p>Uma comunidade local para doar, trocar e reutilizar com propósito.</p>
         </header>
+        <p className="required-fields-note"><strong>*</strong> Campos obrigatórios</p>
         <form onSubmit={submit} className="auth-form register-form">
-          <Field label="Nome completo" icon="person" value={formState.name} onChange={(value) => setFormState((prev) => ({ ...prev, name: value }))} placeholder="Como devemos chamar você?" />
-          <Field label="E-mail" icon="mail" value={formState.email} onChange={(value) => setFormState((prev) => ({ ...prev, email: value }))} placeholder="seu@email.com.br" />
-          <Field label="Senha" icon="lock" type="password" value={formState.password} onChange={(value) => setFormState((prev) => ({ ...prev, password: value }))} placeholder="Mínimo 8 caracteres" />
+          <Field label="Nome completo" icon="person" value={formState.name} onChange={(value) => setFormState((prev) => ({ ...prev, name: value }))} placeholder="Como devemos chamar você?" required />
+          <Field label="E-mail" icon="mail" type="email" value={formState.email} onChange={(value) => { setFormState((prev) => ({ ...prev, email: value })); setEmailNotice(value && !isValidEmailFormat(value) ? 'Digite um e-mail no formato nome@dominio.com.' : ''); }} placeholder="seu@email.com.br" required />
+          {emailNotice ? <p className="email-validation" role="alert">{emailNotice}</p> : null}
+          <Field label="Senha" icon="lock" type="password" value={formState.password} onChange={(value) => setFormState((prev) => ({ ...prev, password: value }))} placeholder="Mínimo 8 caracteres" required minLength={8} />
+          <p className="password-requirements">A senha é obrigatória e deve ter pelo menos 8 caracteres. Não é necessário usar letra maiúscula, letra minúscula ou número.</p>
           <Field label="CEP" icon="markunread_mailbox" value={formState.cep} onChange={lookupCep} placeholder="00000-000" />
           {formState.address ? <div className="address-preview"><span className="material-symbols-outlined">location_on</span><span>{formState.address} · {formState.city}</span>{cepBusy ? <span>Consultando...</span> : null}</div> : null}
-          <Field label="Cidade" icon="location_on" value={formState.city} onChange={(value) => setFormState((prev) => ({ ...prev, city: value }))} placeholder="Ex: São Paulo, SP" />
+          <Field label="Cidade" icon="location_on" value={formState.city} onChange={(value) => setFormState((prev) => ({ ...prev, city: value }))} placeholder="Ex: São Paulo, SP" required />
           <Field label="Bairro público" icon="location_city" value={formState.neighborhood} onChange={(value) => setFormState((prev) => ({ ...prev, neighborhood: value }))} placeholder="Ex: Vila Madalena" />
           <div className="chip-box"><label>Tipo de conta</label><div className="chip-row"><button type="button" className={formState.accountType === 'person' ? 'chip chip-active' : 'chip'} onClick={() => setFormState((prev) => ({ ...prev, accountType: 'person' }))}>Pessoa</button><button type="button" className={formState.accountType === 'business' ? 'chip chip-active' : 'chip'} onClick={() => setFormState((prev) => ({ ...prev, accountType: 'business' }))}>Empresa</button></div></div>
-          {formState.accountType === 'business' ? <><Field label="Razão social" icon="business" value={formState.businessName} onChange={(value) => setFormState((prev) => ({ ...prev, businessName: value }))} placeholder="Nome da empresa" /><Field label={cnpjBusy ? 'Consultando CNPJ...' : 'CNPJ'} icon="badge" value={formState.cnpj} onChange={lookupCnpj} placeholder="00.000.000/0001-00" />{cnpjNotice ? <div className="cnpj-lookup"><span className="material-symbols-outlined">{cnpjNotice.startsWith('Dados') ? 'verified' : 'info'}</span>{cnpjNotice}</div> : null}</> : null}
+          {formState.accountType === 'business' ? <><Field label="Razão social" icon="business" value={formState.businessName} onChange={(value) => setFormState((prev) => ({ ...prev, businessName: value }))} placeholder="Nome da empresa" required /><Field label={cnpjBusy ? 'Consultando CNPJ...' : 'CNPJ'} icon="badge" value={formState.cnpj} onChange={lookupCnpj} placeholder="00.000.000/0001-00" required />{cnpjNotice ? <div className="cnpj-lookup"><span className="material-symbols-outlined">{cnpjNotice.startsWith('Dados') ? 'verified' : 'info'}</span>{cnpjNotice}</div> : null}</> : null}
           <button type="submit" className="primary-btn full register-submit">Criar minha conta <span className="material-symbols-outlined">arrow_forward</span></button>
         </form>
         <div className="register-footer"><span>ou entre em segundos</span><GoogleSignInButton iconOnly /><p>Já faz parte? <button className="text-btn" onClick={onGoToLogin}>Fazer login</button></p></div>
@@ -398,47 +636,76 @@ function GoogleSignInButton({ label = 'Continuar com Google', iconOnly = false }
     window.location.assign('/api/auth/google?return_to=/login');
   }
 
-  return <div className={iconOnly ? 'google-auth google-auth-icon-only' : 'google-auth'}>{iconOnly ? null : <span>ou</span>}<button type="button" className={iconOnly ? 'google-auth-btn google-auth-icon' : 'google-auth-btn'} onClick={start} disabled={busy} aria-label={busy ? 'Abrindo Google' : label} title={label}><b aria-hidden="true">G</b>{iconOnly ? null : busy ? 'Abrindo Google...' : label}</button></div>;
+  return <div className={iconOnly ? 'google-auth google-auth-icon-only' : 'google-auth'}>{iconOnly ? null : <span>ou</span>}<button type="button" className={iconOnly ? 'google-auth-btn google-auth-icon' : 'google-auth-btn'} onClick={start} disabled={busy} aria-label={busy ? 'Abrindo Google' : label} title={label}><GoogleIcon />{iconOnly ? null : busy ? 'Abrindo Google...' : label}</button></div>;
+}
+
+function GoogleIcon() {
+  return (
+    <svg className="google-icon" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+      <path fill="#4285F4" d="M21.35 12.27c0-.72-.06-1.42-.18-2.09H12v3.96h5.23a4.47 4.47 0 0 1-1.94 2.93v2.43h3.14c1.84-1.69 2.92-4.18 2.92-7.23Z" />
+      <path fill="#34A853" d="M12 21.71c2.63 0 4.84-.87 6.45-2.36l-3.14-2.43c-.87.58-1.98.92-3.31.92-2.54 0-4.69-1.72-5.46-4.03H3.3v2.51A9.75 9.75 0 0 0 12 21.71Z" />
+      <path fill="#FBBC05" d="M6.54 13.81a5.86 5.86 0 0 1 0-3.62V7.68H3.3a9.75 9.75 0 0 0 0 8.64l3.24-2.51Z" />
+      <path fill="#EA4335" d="M12 6.16c1.43 0 2.71.49 3.72 1.46l2.79-2.79C16.84 3.27 14.63 2.29 12 2.29a9.75 9.75 0 0 0-8.7 5.39l3.24 2.51C7.31 7.88 9.46 6.16 12 6.16Z" />
+    </svg>
+  );
 }
 
 function FeedScreen({ onNavigate }) {
   const posts = useAppStore((state) => state.posts);
+  const favorites = useAppStore((state) => state.favorites);
   const search = useAppStore((state) => state.search);
   const setSearch = useAppStore((state) => state.setSearch);
   const loadFeed = useAppStore((state) => state.loadFeed);
+  const loadFavorites = useAppStore((state) => state.loadFavorites);
   const loadNotifications = useAppStore((state) => state.loadNotifications);
   const session = useAppStore((state) => state.session);
   const [category, setCategory] = useState('Todos');
+  const [locality,setLocality]=useState('');
+  const [nearby,setNearby]=useState(null);
+  const [nearbyRadius,setNearbyRadius]=useState(10);
+  const [campaignCount, setCampaignCount] = useState(0);
   const [categoriesOpen, setCategoriesOpen] = useState(false);
   const [searchOpen, setSearchOpen] = useState(false);
   const [headerHidden, setHeaderHidden] = useState(false);
+  const notifiedIds = useRef(new Set(JSON.parse(window.localStorage.getItem('reusa_browser_notifications') || '[]')));
+  const feedPosts = category === 'Salvos' ? favorites : posts;
   const filteredPosts = useMemo(() => {
     const query = search.trim().toLowerCase();
-    return posts.filter((post) => {
-      const matchesCategory = category === 'Todos' || post.category.toLowerCase() === category.toLowerCase();
+    return feedPosts.filter((post) => {
+      const matchesCategory = category === 'Todos' || category === 'Salvos' || String(post.category || '').toLowerCase() === category.toLowerCase();
       const matchesSearch = !query || [post.title, post.description, post.category, post.author?.name].some((value) => String(value || '').toLowerCase().includes(query));
-      return matchesCategory && matchesSearch;
-    });
-  }, [posts, search, category]);
+      return matchesCategory && matchesSearch && (!locality.trim() || String(post.location||'').toLocaleLowerCase('pt-BR').includes(locality.trim().toLocaleLowerCase('pt-BR'))) && (nearby===null || nearby.some(p=>p.id===post.id));
+    }).filter(Boolean).sort((a,b)=>nearby===null?0:(nearby.find(p=>p.id===a.id)?.distanceKm??Infinity)-(nearby.find(p=>p.id===b.id)?.distanceKm??Infinity));
+  }, [feedPosts, search, category, locality, nearby]);
 
   useEffect(() => {
     loadFeed().catch(() => {});
-    loadNotifications().catch(() => {});
-    const timer = window.setInterval(() => loadNotifications().catch(() => {}), 15000);
+    if (session) loadFavorites().catch(() => {});
+    const syncNotifications = () => loadNotifications().then((items) => {
+      if (typeof Notification === 'undefined' || Notification.permission !== 'granted') return;
+      const unseen = items.filter((item) => !item.readAt && !notifiedIds.current.has(item.id)).slice(0, 3);
+      unseen.forEach((item) => {
+        showBrowserNotification(item);
+        notifiedIds.current.add(item.id);
+      });
+      window.localStorage.setItem('reusa_browser_notifications', JSON.stringify([...notifiedIds.current].slice(-100)));
+    }).catch(() => {});
+    syncNotifications();
+    const timer = window.setInterval(syncNotifications, 15000);
     return () => window.clearInterval(timer);
-  }, [loadFeed, loadNotifications]);
+  }, [loadFeed, loadFavorites, loadNotifications, session]);
 
   useEffect(() => {
     let previousScroll = window.scrollY;
     const onScroll = () => {
       const currentScroll = window.scrollY;
       const scrollingDown = currentScroll > previousScroll;
-      setHeaderHidden(scrollingDown && currentScroll > 80 && !searchOpen);
+      setHeaderHidden(scrollingDown && currentScroll > 80 && !searchOpen && !categoriesOpen);
       previousScroll = currentScroll;
     };
     window.addEventListener('scroll', onScroll, { passive: true });
     return () => window.removeEventListener('scroll', onScroll);
-  }, [searchOpen]);
+  }, [searchOpen, categoriesOpen]);
 
   function toggleCategories() {
     setHeaderHidden(false);
@@ -448,14 +715,32 @@ function FeedScreen({ onNavigate }) {
   return (
     <Shell nav={navRoutes} active="/feed" className="feed-shell">
       <header className={headerHidden ? 'topbar feed-topbar feed-topbar-hidden' : 'topbar feed-topbar'}>
-        <div className="brand"><img className="feed-logo" src={feedLogo} alt="ReUsa+" /><span>ReUsa+</span></div>
-        {searchOpen ? <label className="searchbar feed-search-expanded"><span className="material-symbols-outlined">search</span><input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') setSearchOpen(false); }} placeholder="Buscar anúncios" autoFocus /><button type="button" className={categoriesOpen ? 'category-trigger category-trigger-active' : 'category-trigger'} onClick={toggleCategories} aria-expanded={categoriesOpen} aria-label="Escolher categoria"><span className="material-symbols-outlined">category</span></button><button type="button" className="feed-search-close" onClick={() => setSearchOpen(false)} aria-label="Fechar busca"><span className="material-symbols-outlined">close</span></button></label> : <div className="feed-search-tools"><button type="button" className="icon-btn feed-search-trigger" onClick={() => setSearchOpen(true)} aria-label="Abrir busca"><span className="material-symbols-outlined">search</span></button><button type="button" className={categoriesOpen ? 'category-trigger category-trigger-active' : 'category-trigger'} onClick={toggleCategories} aria-expanded={categoriesOpen} aria-label="Escolher categoria"><span className="material-symbols-outlined">category</span></button></div>}
-        <div className="topbar-actions"><button className="avatar-btn header-profile-btn" onClick={() => onNavigate('/perfil')} aria-label="Abrir perfil">{session?.avatar ? <img src={session.avatar} alt="" /> : <span className="material-symbols-outlined">person</span>}</button></div>
+        <a className="brand unified-brand" href="/feed" aria-label="ReUsa+, início"><img className="feed-logo" src={feedLogo} alt="ReUsa+" /></a>
+        {searchOpen ? <label className="searchbar feed-search-expanded"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg><input value={search} onChange={(e) => setSearch(e.target.value)} onKeyDown={(event) => { if (event.key === 'Escape') setSearchOpen(false); }} placeholder="Buscar anúncios" autoFocus /><button type="button" className={categoriesOpen ? 'category-trigger category-trigger-active' : 'category-trigger'} onClick={toggleCategories} aria-expanded={categoriesOpen} title="Preferências do feed" aria-label="Preferências do feed" aria-controls="feed-preferences"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><path d="M4 7h4m4 0h8M4 17h8m4 0h4"/><circle cx="10" cy="7" r="2"/><circle cx="14" cy="17" r="2"/></svg></button><button type="button" className="feed-search-close" onClick={() => setSearchOpen(false)} aria-label="Fechar busca"><span className="material-symbols-outlined">close</span></button></label> : <div className="feed-search-tools"><button type="button" className="icon-btn feed-search-trigger" onClick={() => setSearchOpen(true)} aria-label="Abrir busca"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5"/><path d="m16 16 5 5"/></svg></button><button type="button" className={categoriesOpen ? 'category-trigger category-trigger-active' : 'category-trigger'} onClick={toggleCategories} aria-expanded={categoriesOpen} title="Preferências do feed" aria-label="Preferências do feed" aria-controls="feed-preferences"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" aria-hidden="true"><path d="M4 7h4m4 0h8M4 17h8m4 0h4"/><circle cx="10" cy="7" r="2"/><circle cx="14" cy="17" r="2"/></svg></button></div>}
+        <div className="topbar-actions">
+          <button type="button" className="icon-btn feed-header-shortcut" aria-label="Pedidos da comunidade" title="Pedidos da comunidade" onClick={()=>onNavigate('/pedidos')}><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 5h16v15H4zM8 3v4m8-4v4M8 11h8m-8 4h5"/></svg></button>
+          <button type="button" className="icon-btn feed-header-shortcut" aria-label="Meus alertas de itens" title="Meus alertas de itens" onClick={()=>onNavigate(session?'/alertas':'/login')}><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4m-2-19v1"/></svg></button>
+
+          {session && <button className="icon-btn" aria-label="Minhas negociações" title="Minhas negociações" onClick={()=>onNavigate('/negociacoes')}><svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7h16m-4-4 4 4-4 4M20 17H4m4-4-4 4 4 4"/></svg></button>}
+          {session && <button id="create-campaign-trigger" type="button" className="campaign-header-trigger" aria-label="Criar campanha" title="Criar campanha" onClick={() => onNavigate('/nova-campanha')}>
+            <svg width="23" height="23" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1.1-1.1a5.5 5.5 0 0 0-7.8 7.8L12 21l8.8-8.6a5.5 5.5 0 0 0 0-7.8Z"/><path d="M12 9v6m-3-3h6"/></svg>
+          </button>}
+          <HeaderProfileButton />
+        </div>
       </header>
-      <div className="feed-category-popover">{categoriesOpen ? <CategoryBar selected={category} onChange={(value) => { setCategory(value); setCategoriesOpen(false); }} /> : null}</div>
+      <div className="feed-category-popover">{categoriesOpen && <section id="feed-preferences" className="feed-preferences-panel" aria-label="Preferências do feed">
+        <header><h2>Preferências do feed</h2><button type="button" className="text-btn" aria-label="Fechar preferências" onClick={()=>{setCategoriesOpen(false);document.querySelector('[aria-controls="feed-preferences"]')?.focus()}}>Fechar</button></header>
+        <CategoryBar selected={category} onChange={setCategory} showSaved={Boolean(session)} savedCount={favorites.length}/>
+        <FeedLocationFilters session={session} city={locality} onCity={setLocality} nearby={nearby} onNearby={setNearby} onNavigate={onNavigate} radius={nearbyRadius} onRadius={setNearbyRadius}/>
+      </section>}</div>
       <main className="feed-page">
+        <section className="feed-available-heading" aria-labelledby="feed-available-title">
+          <span className="material-symbols-outlined" aria-hidden="true">inventory_2</span>
+          <h1 id="feed-available-title">No seu feed</h1>
+        </section>
         <div className="feed-list">
-          {filteredPosts.length ? filteredPosts.map((post) => <FeedCard key={post.id} post={post} onOpenChat={async () => { try { const thread = await useAppStore.getState().createThread(post.id); onNavigate(`/mensagens/ana?thread=${thread.id}`); } catch (error) { alert(error.message); } }} />) : <div className="empty-state"><span className="material-symbols-outlined">search_off</span><h2>Nada encontrado</h2><p>Tente outra busca ou categoria.</p></div>}
+        <CampaignFeed session={session} search={search} showCampaigns={category === 'Todos' && nearby===null && !locality.trim()} onCountChange={setCampaignCount} />
+          {filteredPosts.length ? filteredPosts.map((post) => <FeedCard key={post.id} post={post} onNavigate={onNavigate} onOpenChat={async () => { try { const thread = await useAppStore.getState().createThread(post.id); onNavigate(`/mensagens/ana?thread=${thread.id}`); } catch (error) { alert(error.message); } }} onOpenPayment={async () => useAppStore.getState().createThread(post.id)} />) : (category === 'Todos' && campaignCount > 0) ? null : <div className="empty-state"><span className="material-symbols-outlined">{category === 'Salvos' ? 'bookmark_border' : 'search_off'}</span><h2>{category === 'Salvos' ? 'Nenhum item salvo' : 'Nada encontrado'}</h2><p>{category === 'Salvos' ? 'Toque no marcador de um anúncio para encontrá-lo aqui.' : 'Tente outra busca ou categoria.'}</p></div>}
         </div>
       </main>
     </Shell>
@@ -465,13 +750,31 @@ function FeedScreen({ onNavigate }) {
 function NotificationsScreen({ onBack, onNavigate }) {
   const [notifications, setNotifications] = useState([]);
   const loadNotifications = useAppStore((state) => state.loadNotifications);
-  useEffect(() => { loadNotifications().then((items) => setNotifications(items)).catch(() => {}); }, [loadNotifications]);
+  const [browserPermission, setBrowserPermission] = useState(typeof Notification === 'undefined' ? 'unsupported' : Notification.permission);
+  useEffect(() => {
+    let active = true;
+    const syncNotifications = () => loadNotifications().then((items) => {
+      if (active) setNotifications(items);
+    }).catch(() => {});
+    syncNotifications();
+    const timer = window.setInterval(syncNotifications, 15000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [loadNotifications]);
+  async function enableBrowserNotifications() {
+    if (typeof Notification === 'undefined') return;
+    const permission = await Notification.requestPermission();
+    setBrowserPermission(permission);
+    if (permission === 'granted') showBrowserNotification({ id: 'browser-permission', title: 'Notificações ativadas', text: 'Você receberá avisos do ReUsa+ neste navegador.' });
+  }
   const iconFor = (type) => ({ message: 'chat', comment: 'chat_bubble', like: 'favorite', interest: 'handshake', negotiation: 'swap_horiz', review: 'star', system: 'notifications' }[type] || 'notifications');
   async function openNotification(notification) {
     try { await api.readNotification(notification.id); setNotifications((items) => items.map((item) => item.id === notification.id ? { ...item, readAt: new Date().toISOString() } : item)); await loadNotifications(); } catch {}
     onNavigate(notification.link || '/feed');
   }
-  return <Shell nav={navRoutes} active="/notificacoes"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Notificações</h1></header><main className="page padded-top"><div className="notification-list">{notifications.length ? notifications.map((notification) => <button className={notification.readAt ? 'notification-item' : 'notification-item notification-unread'} key={notification.id} onClick={() => openNotification(notification)}><span className="notification-icon material-symbols-outlined">{iconFor(notification.type)}</span><span><strong>{notification.title}</strong><p>{notification.text}</p><small>{formatBrazilDate(notification.createdAt)} às {formatBrazilTime(notification.createdAt)}</small></span></button>) : <EmptyState icon="notifications_none" title="Nenhuma notificação nova" text="Quando algo acontecer na sua comunidade, avisaremos por aqui." />}</div></main></Shell>;
+  return <Shell nav={navRoutes} active="/notificacoes"><UnifiedTopbar onBack={onBack} /><main className="page padded-top"><section className="browser-notification-card"><div><span className="eyebrow">Notificações do sistema</span><p>Receba avisos do ReUsa+ neste navegador enquanto a página estiver aberta.</p></div>{browserPermission === 'granted' ? <span className="notification-enabled"><span className="material-symbols-outlined">check_circle</span>Ativadas</span> : browserPermission === 'unsupported' ? <small>Navegador incompatível</small> : browserPermission === 'denied' ? <small>Permissão bloqueada. Libere as notificações nas configurações do navegador.</small> : <button className="secondary-btn" onClick={enableBrowserNotifications}><span className="material-symbols-outlined">notifications_active</span>Ativar no navegador</button>}</section><div className="notification-list">{notifications.length ? notifications.map((notification) => <button className={notification.readAt ? 'notification-item' : 'notification-item notification-unread'} key={notification.id} onClick={() => openNotification(notification)}><span className="notification-icon material-symbols-outlined">{iconFor(notification.type)}</span><span><strong>{notification.title}</strong><p>{notification.text}</p><small>{formatBrazilDate(notification.createdAt)} às {formatBrazilTime(notification.createdAt)}</small></span></button>) : <EmptyState icon="notifications_none" title="Nenhuma notificação nova" text="Quando algo acontecer na sua comunidade, avisaremos por aqui." />}</div></main></Shell>;
 }
 
 function InspirationsScreen({ onNavigate }) {
@@ -485,7 +788,7 @@ function InspirationsScreen({ onNavigate }) {
   const visibleProducts = products.filter((product) => `${product.title} ${product.material} ${product.creator}`.toLowerCase().includes(search.toLowerCase()));
   return (
     <Shell nav={navRoutes} active="/inspiracoes">
-      <UnifiedTopbar title="Inspirações" onBack={() => onNavigate('/feed')} action={<button className="icon-btn" onClick={() => onNavigate('/ana-ia')} aria-label="Abrir Ana IA"><span className="material-symbols-outlined">auto_awesome</span></button>} />
+      <UnifiedTopbar onBack={() => onNavigate('/feed')} />
       <main className="page inspiration-page"><div className="inspiration-intro"><span className="eyebrow">Vitrine circular</span><h2>Produtos com uma segunda vida</h2><p>Descubra criações da comunidade e apoie quem transforma descarte em design.</p><button className="primary-btn" onClick={() => onNavigate('/nova-inspiracao')}><span className="material-symbols-outlined">add</span>Anunciar minha criação</button></div><label className="search-shell"><span className="material-symbols-outlined">search</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar por material ou criador" /></label><div className="product-grid">{visibleProducts.map((product) => <article className="product-card" key={product.id}><img src={product.imageUrl} alt={product.title} /><div className="product-card-body"><span className="product-material">{product.material}</span><h3>{product.title}</h3><p>{product.description}</p><div className="product-meta"><strong>{product.price}</strong><span>{product.creator} · {product.city}</span></div><button className="ghost-btn product-contact" onClick={() => onNavigate('/mensagens')}>Conhecer criador</button></div></article>)}</div></main>
     </Shell>
   );
@@ -499,7 +802,7 @@ function CreateInspirationScreen({ onBack, onSuccess }) {
     setBusy(true);
     try { await api.createInspiration(form); onSuccess(); } catch (error) { alert(error.message); } finally { setBusy(false); }
   }
-  return <div className="post-screen"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Anunciar criação</h1></header><main className="page padded-bottom"><section className="composer-card"><span className="eyebrow">Vitrine circular</span><h2>Mostre o que você criou</h2><p>Compartilhe um produto feito com materiais reaproveitados.</p><form className="composer-form" onSubmit={submit}><Field label="Nome do produto" icon="title" value={form.title} onChange={(value) => setForm((current) => ({ ...current, title: value }))} placeholder="Ex: Luminária de garrafas" /><Field label="Material reaproveitado" icon="recycling" value={form.material} onChange={(value) => setForm((current) => ({ ...current, material: value }))} placeholder="Ex: garrafas de vidro" /><Field label="Preço" icon="payments" value={form.price} onChange={(value) => setForm((current) => ({ ...current, price: value }))} placeholder="Ex: R$ 80,00" /><Field label="Descrição" icon="description" value={form.description} onChange={(value) => setForm((current) => ({ ...current, description: value }))} placeholder="Conte como a peça foi feita..." multiline /><Field label="URL da foto (opcional)" icon="image" value={form.imageUrl} onChange={(value) => setForm((current) => ({ ...current, imageUrl: value }))} placeholder="https://..." /><button className="primary-btn full" disabled={busy}>{busy ? 'Publicando...' : 'Publicar na vitrine'}<span className="material-symbols-outlined">send</span></button></form></section></main></div>;
+  return <div className="post-screen"><UnifiedTopbar onBack={onBack} /><main className="page padded-bottom"><section className="composer-card"><span className="eyebrow">Vitrine circular</span><h2>Mostre o que você criou</h2><p>Compartilhe um produto feito com materiais reaproveitados.</p><form className="composer-form" onSubmit={submit}><Field label="Nome do produto" icon="title" value={form.title} onChange={(value) => setForm((current) => ({ ...current, title: value }))} placeholder="Ex: Luminária de garrafas" /><Field label="Material reaproveitado" icon="recycling" value={form.material} onChange={(value) => setForm((current) => ({ ...current, material: value }))} placeholder="Ex: garrafas de vidro" /><Field label="Preço" icon="payments" value={form.price} onChange={(value) => setForm((current) => ({ ...current, price: value }))} placeholder="Ex: R$ 80,00" /><Field label="Descrição" icon="description" value={form.description} onChange={(value) => setForm((current) => ({ ...current, description: value }))} placeholder="Conte como a peça foi feita..." multiline /><Field label="URL da foto (opcional)" icon="image" value={form.imageUrl} onChange={(value) => setForm((current) => ({ ...current, imageUrl: value }))} placeholder="https://..." /><button className="primary-btn full" disabled={busy}>{busy ? 'Publicando...' : 'Publicar na vitrine'}<span className="material-symbols-outlined">send</span></button></form></section></main></div>;
 }
 
 function AiIdeasScreen({ onBack }) {
@@ -531,15 +834,16 @@ function AiIdeasScreen({ onBack }) {
     } catch (error) { alert(error.message); }
   }
 
-  return <div className="ai-page"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Ana IA</h1><span className="ai-status">online</span></header><main className="ai-content"><div className="ai-hero"><span className="ai-icon material-symbols-outlined">auto_awesome</span><span className="eyebrow">Assistente de reaproveitamento</span><h2>O que você quer reaproveitar?</h2><p>Conte sobre os materiais e a Ana sugere uma ideia prática e segura.</p></div><form className="ai-form" onSubmit={ask}><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Material disponível: ex. garrafas de vidro" rows={3} /><div className="ai-preferences"><input value={quantity} onChange={(event) => setQuantity(event.target.value)} placeholder="Quantidade aproximada" /><input value={objective} onChange={(event) => setObjective(event.target.value)} placeholder="Objetivo (decorar, organizar...)" /><select value={difficulty} onChange={(event) => setDifficulty(event.target.value)}><option>Fácil</option><option>Média</option><option>Avançada</option></select></div><button className="primary-btn full" disabled={busy}>{busy ? 'Pensando...' : 'Gerar ideia'}<span className="material-symbols-outlined">arrow_forward</span></button></form>{result ? <section className="ai-result"><span className="eyebrow">Sugestão da Ana · {result.difficulty}</span><h2>{result.title}</h2><p>{result.reuse || result.summary}</p><div className="ai-facts"><div><strong>Tempo</strong><span>{result.time}</span></div><div><strong>Materiais</strong><span>{result.materials.join(', ')}</span></div></div><h3>Como poderia ser reaproveitado</h3><ol>{result.steps.map((step) => <li key={step}>{step}</li>)}</ol><div className="ai-care"><span className="material-symbols-outlined">health_and_safety</span><span>{result.care}</span></div><button className="secondary-btn full" onClick={publishInspiration}><span className="material-symbols-outlined">storefront</span>Publicar como inspiração</button></section> : <div className="ai-prompts"><span>Tente perguntar:</span><button onClick={() => setPrompt('garrafas de vidro')}>garrafas de vidro</button><button onClick={() => setPrompt('madeira e pallet')}>madeira e pallet</button><button onClick={() => setPrompt('latas de alumínio')}>latas</button></div>}</main></div>;
+  return <div className="ai-page"><UnifiedTopbar onBack={onBack} /><main className="ai-content"><div className="ai-hero"><span className="ai-icon material-symbols-outlined">auto_awesome</span><span className="eyebrow">Assistente de reaproveitamento</span><h2>O que você quer reaproveitar?</h2><p>Conte sobre os materiais e a Ana sugere uma ideia prática e segura.</p></div><form className="ai-form" onSubmit={ask}><textarea value={prompt} onChange={(event) => setPrompt(event.target.value)} placeholder="Material disponível: ex. garrafas de vidro" rows={3} /><div className="ai-preferences"><input value={quantity} onChange={(event) => setQuantity(event.target.value)} placeholder="Quantidade aproximada" /><input value={objective} onChange={(event) => setObjective(event.target.value)} placeholder="Objetivo (decorar, organizar...)" /><select value={difficulty} onChange={(event) => setDifficulty(event.target.value)}><option>Fácil</option><option>Média</option><option>Avançada</option></select></div><button className="primary-btn full" disabled={busy}>{busy ? 'Pensando...' : 'Gerar ideia'}<span className="material-symbols-outlined">arrow_forward</span></button></form>{result ? <section className="ai-result"><span className="eyebrow">Sugestão da Ana · {result.difficulty}</span><h2>{result.title}</h2><p>{result.reuse || result.summary}</p><div className="ai-facts"><div><strong>Tempo</strong><span>{result.time}</span></div><div><strong>Materiais</strong><span>{result.materials.join(', ')}</span></div></div><h3>Como poderia ser reaproveitado</h3><ol>{result.steps.map((step) => <li key={step}>{step}</li>)}</ol><div className="ai-care"><span className="material-symbols-outlined">health_and_safety</span><span>{result.care}</span></div><button className="secondary-btn full" onClick={publishInspiration}><span className="material-symbols-outlined">storefront</span>Publicar como inspiração</button></section> : <div className="ai-prompts"><span>Tente perguntar:</span><button onClick={() => setPrompt('garrafas de vidro')}>garrafas de vidro</button><button onClick={() => setPrompt('madeira e pallet')}>madeira e pallet</button><button onClick={() => setPrompt('latas de alumínio')}>latas</button></div>}</main></div>;
 }
 
-function CategoryBar({ selected, onChange }) {
+function CategoryBar({ selected, onChange, showSaved = false, savedCount = 0 }) {
   const items = ['Todos', 'Eletrônicos', 'Roupas', 'Móveis', 'Livros', 'Plástico'];
-  return <section className="category-panel feed-category-panel" aria-label="Categorias de anúncios">{items.map((item) => <button key={item} onClick={() => onChange(item)} className={selected === item ? 'pill pill-active' : 'pill'}>{item}</button>)}</section>;
+  return <section className="category-panel feed-category-panel" aria-label="Categorias de anúncios">{items.map((item) => <button key={item} onClick={() => onChange(item)} className={selected === item ? 'pill pill-active' : 'pill'}>{item}</button>)}{showSaved ? <button onClick={() => onChange('Salvos')} className={selected === 'Salvos' ? 'pill pill-active saved-filter-pill' : 'pill saved-filter-pill'}><span className="material-symbols-outlined">bookmark</span>Salvos{savedCount ? <b>{savedCount}</b> : null}</button> : null}</section>;
 }
 
-function FeedCard({ post, onOpenChat }) {
+function FeedCard({ post, onNavigate, onOpenChat, onOpenPayment }) {
+  const stripePixEnabled = useAppStore((state) => Boolean(state.profile?.user?.stripePixEnabled ?? state.session?.stripePixEnabled));
   const toggleLike = useAppStore((state) => state.toggleLike);
   const toggleFavorite = useAppStore((state) => state.toggleFavorite);
   const deletePost = useAppStore((state) => state.deletePost);
@@ -554,6 +858,27 @@ function FeedCard({ post, onOpenChat }) {
   const [commentBusy, setCommentBusy] = useState(false);
   const [heartAnimationKey, setHeartAnimationKey] = useState(0);
   const [saveAnimationKey, setSaveAnimationKey] = useState(0);
+  const [interestOptionsOpen, setInterestOptionsOpen] = useState(false);
+  const [proposalOpen, setProposalOpen] = useState(false);
+  const [proposalNegotiation, setProposalNegotiation] = useState(null);
+  const [proposalForm, setProposalForm] = useState({ amount: '', method: 'card' });
+  const [proposalBusy, setProposalBusy] = useState(false);
+  const [proposalSent, setProposalSent] = useState(false);
+  const [offerStatus, setOfferStatus] = useState(post.offerStatus || 'none');
+  const listingLocation = post.location || post.author?.city || '';
+  const isSale = post.goal === 'Venda';
+  const offerStatusLabel = offerStatus === 'accepted' ? 'Oferta aceita' : offerStatus === 'rejected' ? 'Oferta recusada' : offerStatus === 'cancelled' ? 'Oferta cancelada' : 'Proposta aguardando resposta';
+  const offerStatusIcon = offerStatus === 'accepted' ? 'check_circle' : ['rejected', 'cancelled'].includes(offerStatus) ? 'cancel' : 'schedule';
+  const [now, setNow] = useState(Date.now());
+
+  useEffect(() => {
+    const timer = window.setInterval(() => setNow(Date.now()), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  useEffect(() => {
+    setOfferStatus(post.offerStatus || 'none');
+  }, [post.offerStatus]);
 
   async function like() {
     try {
@@ -563,31 +888,6 @@ function FeedCard({ post, onOpenChat }) {
       if (result.liked) setHeartAnimationKey((current) => current + 1);
     } catch (error) {
       alert(error.message);
-    }
-  }
-
-  async function lookupCnpj(value) {
-    const cnpj = value.replace(/\D/g, '').slice(0, 14);
-    setFormState((prev) => ({ ...prev, cnpj }));
-    setCnpjNotice('');
-    if (cnpj.length !== 14) return;
-    setCnpjBusy(true);
-    try {
-      const { business } = await api.businessByCnpj(cnpj);
-      setFormState((prev) => ({
-        ...prev,
-        cnpj,
-        businessName: business.legalName || business.tradeName || prev.businessName,
-        cep: business.cep || prev.cep,
-        address: business.address || prev.address,
-        neighborhood: business.neighborhood || prev.neighborhood,
-        city: business.city || prev.city
-      }));
-      setCnpjNotice(business.status ? `Dados preenchidos · ${business.status}` : 'Dados da empresa preenchidos.');
-    } catch (error) {
-      setCnpjNotice(error.message === 'CNPJ not found' ? 'CNPJ não encontrado. Preencha os dados manualmente.' : 'Não foi possível consultar agora. Você pode preencher manualmente.');
-    } finally {
-      setCnpjBusy(false);
     }
   }
 
@@ -625,16 +925,60 @@ function FeedCard({ post, onOpenChat }) {
     try { await deletePost(post.id); } catch (error) { alert(error.message); }
   }
 
+  async function openProposal() {
+    if (!isSale) return;
+    if (!['none', 'cancelled'].includes(offerStatus)) {
+      alert('Você já enviou uma oferta para este anúncio.');
+      return;
+    }
+    setInterestOptionsOpen(false);
+    setProposalOpen(true);
+    setProposalSent(false);
+    try {
+      await onOpenPayment();
+      const result = await api.negotiation(post.id);
+      if (result.negotiation?.status === 'reserved') {
+        setProposalOpen(false);
+        alert('Este anúncio já foi reservado para você. Abra o anúncio para continuar o pagamento.');
+        onNavigate(`/anuncios/${post.id}`);
+        return;
+      }
+      setProposalNegotiation(result.negotiation);
+    } catch (error) {
+      setProposalOpen(false);
+      alert(error.message);
+    }
+  }
+
+  async function submitProposal(event) {
+    event.preventDefault();
+    if (!isSale || !proposalNegotiation || proposalBusy) return;
+    const digits = String(proposalForm.amount).replace(/\D/g, '');
+    const amountCents = Number(digits);
+    if (!Number.isSafeInteger(amountCents) || amountCents < 100) return alert('Informe um valor válido a partir de R$ 1,00.');
+    setProposalBusy(true);
+    try {
+      await api.createProposal(proposalNegotiation.id, { amountCents, method: proposalForm.method });
+      setOfferStatus('pending');
+      setProposalSent(true);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setProposalBusy(false);
+    }
+  }
+
   return (
-    <article className="card post-card">
+    <article className={isSale ? 'card post-card is-sale' : 'card post-card'}>
       <div className="post-head">
         <button className={saved ? 'icon-btn saved-btn' : 'icon-btn'} onClick={favorite} aria-label={saved ? 'Remover dos salvos' : 'Salvar anúncio'}><span key={saveAnimationKey} className={saved ? 'material-symbols-outlined save-icon saved-bookmark' : 'material-symbols-outlined save-icon'}>{saved ? 'bookmark' : 'bookmark_border'}</span></button>
         {post.author.avatar ? <img className="avatar" src={post.author.avatar} alt={post.author.name} /> : <span className="avatar avatar-placeholder material-symbols-outlined" aria-label={`Perfil de ${post.author.name}`}>person</span>}
-        <div className="post-meta"><strong>{post.author.name}</strong><span>Há 2 horas • {post.author.city}</span></div>
+        <div className="post-meta"><strong>{post.author.name}</strong><span>{formatRelativeTime(post.createdAt, now)}{listingLocation ? ` • ${listingLocation}` : ''}</span></div>
         {post.authorId === session?.id ? <button className="icon-btn" onClick={removePost} title="Excluir anúncio" aria-label="Excluir anúncio"><span className="material-symbols-outlined">delete</span></button> : null}
+        {offerStatus !== 'none' ? <div className={`offer-status post-offer-status offer-status-${offerStatus}`} role="status" title={offerStatusLabel}><span className="material-symbols-outlined" aria-hidden="true">{offerStatusIcon}</span><span className="offer-status-label">{offerStatusLabel}</span></div> : null}
       </div>
       <div className="post-image-wrap">
-        <img className="post-image" src={post.imageUrl} alt={post.title} />
+        <PostMediaGallery post={post} variant="feed" onOpenPost={() => onNavigate(`/anuncios/${post.id}`)} />
         <div className="chip-float"><span className="material-symbols-outlined">{post.chipIcon}</span>{post.chipLabel}</div>
       </div>
       <div className="post-body">
@@ -644,9 +988,14 @@ function FeedCard({ post, onOpenChat }) {
       <div className="tag-row feed-post-tags"><span>{post.category}</span><span>{post.condition}</span><span className={`status-tag status-${String(post.status || 'Disponível').toLowerCase().replace(/\s+/g, '-')}`}>{post.status || 'Disponível'}</span></div>
       <div className="post-actions">
         <div className="post-stats"><button className={liked ? 'ghost-inline liked' : 'ghost-inline'} onClick={like}><span key={heartAnimationKey} className={liked ? 'material-symbols-outlined like-icon liked-heart' : 'material-symbols-outlined like-icon'}>{liked ? 'favorite' : 'favorite_border'}</span>{likes}</button><button className="ghost-inline" onClick={toggleComments}><span className="material-symbols-outlined">chat_bubble</span>{commentCount}</button></div>
-        {post.authorId !== session?.id ? <button className="primary-btn compact" onClick={onOpenChat}><span className="material-symbols-outlined">handshake</span>{post.goal === 'Troca' ? 'Fazer oferta' : 'Tenho interesse'}</button> : <span className="post-owner-label">Seu anúncio</span>}
+        <div className="post-action-ctas">
+          <button type="button" className="view-post-btn" onClick={() => onNavigate(`/anuncios/${post.id}`)} aria-label={`Ver anúncio: ${post.title}`}><span className="material-symbols-outlined" aria-hidden="true">visibility</span>Ver anúncio</button>
+          {post.authorId !== session?.id ? <button className="primary-btn compact" disabled={!['none', 'cancelled'].includes(offerStatus)} onClick={() => setInterestOptionsOpen(true)}><span className="material-symbols-outlined">handshake</span>{!['none', 'cancelled'].includes(offerStatus) ? 'Oferta enviada' : 'Tenho interesse'}</button> : <span className="post-owner-label">Seu anúncio</span>}
+        </div>
       </div>
-      {commentsOpen ? <section className="comments-panel"><div className="comments-list">{comments.length ? comments.map((comment) => <div className="comment" key={comment.id}><img src={comment.avatar} alt="" /><div><strong>{comment.name}</strong><p>{comment.text}</p></div></div>) : commentCount === 0 ? <p className="comments-empty">Ainda não há comentários. Seja o primeiro.</p> : null}</div><form className="comment-form" onSubmit={addComment}><input value={commentText} maxLength="500" onChange={(event) => setCommentText(event.target.value)} placeholder="Escreva um comentário..." /><button className="send-btn" disabled={commentBusy} aria-label="Publicar comentário"><span className="material-symbols-outlined">send</span></button></form></section> : null}
+      {commentsOpen ? <section className="comments-panel"><div className="comments-list">{comments.length ? comments.map((comment) => <div className="comment" key={comment.id}>{comment.avatar ? <img src={comment.avatar} alt="" /> : <span className="avatar-placeholder material-symbols-outlined" aria-hidden="true">person</span>}<div><strong>{comment.name}</strong><p>{comment.text}</p></div></div>) : commentCount === 0 ? <p className="comments-empty">Ainda não há comentários. Seja o primeiro.</p> : null}</div><form className="comment-form" onSubmit={addComment}><input value={commentText} maxLength="500" onChange={(event) => setCommentText(event.target.value)} placeholder="Escreva um comentário..." /><button className="send-btn" disabled={commentBusy} aria-label="Publicar comentário"><span className="material-symbols-outlined">send</span></button></form></section> : null}
+      {interestOptionsOpen ? <ModalPortal><div className="interest-modal-backdrop" role="presentation" onClick={() => setInterestOptionsOpen(false)}><section className="interest-modal" role="dialog" aria-modal="true" aria-labelledby={`interest-title-${post.id}`} onClick={(event) => event.stopPropagation()}><button type="button" className="interest-modal-close" onClick={() => setInterestOptionsOpen(false)} aria-label="Fechar opções"><span className="material-symbols-outlined">close</span></button><div className="interest-modal-heading"><span className="interest-modal-badge"><span className="material-symbols-outlined">handshake</span></span><span className="eyebrow">Tenho interesse</span></div><h2 id={`interest-title-${post.id}`}>Como você quer continuar?</h2><p>Escolha uma forma de iniciar sua negociação com o anunciante.</p><div className="interest-modal-actions"><button type="button" className="interest-choice interest-choice-message" onClick={() => { setInterestOptionsOpen(false); onOpenChat(); }}><span className="interest-choice-icon"><span className="material-symbols-outlined">chat_bubble</span></span><span className="interest-choice-copy"><strong>Conversar por mensagem</strong><small>Combine os detalhes pelo chat</small></span><span className="material-symbols-outlined interest-choice-arrow">arrow_forward</span></button><button type="button" className="interest-choice interest-choice-payment" onClick={openProposal}><span className="interest-choice-icon"><span className="material-symbols-outlined">payments</span></span><span className="interest-choice-copy"><strong>Fazer oferta em dinheiro</strong><small>Pagamento após reserva e acordo de entrega</small></span><span className="material-symbols-outlined interest-choice-arrow">arrow_forward</span></button></div><small className="interest-modal-note"><span className="material-symbols-outlined">info</span>O pagamento só será liberado após a reserva e o aceite do local e horário de entrega pelas duas pessoas.</small></section></div></ModalPortal> : null}
+      {proposalOpen ? <ModalPortal><div className="interest-modal-backdrop" role="presentation" onClick={() => setProposalOpen(false)}><section className="interest-modal proposal-modal" role="dialog" aria-modal="true" aria-labelledby={`proposal-title-${post.id}`} onClick={(event) => event.stopPropagation()}><button type="button" className="interest-modal-close" onClick={() => setProposalOpen(false)} aria-label="Fechar proposta"><span className="material-symbols-outlined">close</span></button><div className="interest-modal-heading"><span className="interest-modal-badge proposal-modal-badge"><span className="material-symbols-outlined">payments</span></span><span className="eyebrow">Oferta de pagamento</span></div>{proposalSent ? <><h2 id={`proposal-title-${post.id}`}>Proposta enviada!</h2><p>Sua oferta foi enviada e aguarda a resposta do vendedor.</p><div className="proposal-success"><span className="material-symbols-outlined">schedule</span><strong>Você poderá pagar depois que o vendedor aceitar e reservar o anúncio.</strong></div><button type="button" className="primary-btn proposal-close-action" onClick={() => setProposalOpen(false)}>Voltar ao feed</button></> : <><h2 id={`proposal-title-${post.id}`}>Envie sua proposta</h2><p>Informe o valor e a forma de pagamento para o vendedor analisar.</p>{proposalNegotiation ? <form className="proposal-modal-form" onSubmit={submitProposal}><label>Valor da oferta (R$)<input inputMode="decimal" value={proposalForm.amount} onChange={(event) => setProposalForm((current) => ({ ...current, amount: formatMoneyInput(event.target.value) }))} placeholder="10,00" required /></label><label>Forma de pagamento<select value={proposalForm.method} onChange={(event) => setProposalForm((current) => ({ ...current, method: event.target.value }))}><option value="card">Cartão</option><option value="pix" disabled={!stripePixEnabled}>PIX{stripePixEnabled ? "" : " (indisponível)"}</option></select></label><button className="primary-btn" disabled={proposalBusy}>{proposalBusy ? 'Enviando...' : 'Enviar proposta'}<span className="material-symbols-outlined">send</span></button></form> : <div className="proposal-loading"><span className="material-symbols-outlined">progress_activity</span>Preparando sua proposta...</div>}</>}</section></div></ModalPortal> : null}
     </article>
   );
 }
@@ -654,23 +1003,37 @@ function FeedCard({ post, onOpenChat }) {
 function MessagesScreen({ onOpenThread }) {
   const threads = useAppStore((state) => state.threads);
   const loadThreads = useAppStore((state) => state.loadThreads);
+  const loadNotifications = useAppStore((state) => state.loadNotifications);
+  const clearMessages = useAppStore((state) => state.clearMessages);
   const [search, setSearch] = useState('');
+  const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
-    loadThreads().catch(() => {});
-    const timer = window.setInterval(() => loadThreads().catch(() => {}), 3000);
+    const sync = () => Promise.all([loadThreads(), loadNotifications()]).catch(() => {});
+    sync();
+    const timer = window.setInterval(sync, 3000);
     return () => window.clearInterval(timer);
-  }, [loadThreads]);
+  }, [loadThreads, loadNotifications]);
 
   const visibleThreads = threads.filter((thread) => `${thread.title} ${thread.subtitle}`.toLowerCase().includes(search.toLowerCase()));
+  async function clearAll() {
+    if (!threads.length || clearing || !window.confirm('Limpar todas as suas mensagens? O histórico dos outros participantes será preservado.')) return;
+    setClearing(true);
+    try {
+      await clearMessages();
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setClearing(false);
+    }
+  }
   return (
     <Shell nav={navRoutes} active="/mensagens">
-      <UnifiedTopbar />
+      <UnifiedTopbar action={<div className="messages-header-actions"><button className="icon-btn messages-clear-action" type="button" onClick={clearAll} disabled={!threads.length || clearing} aria-busy={clearing} aria-label="Limpar todas as mensagens" title="Limpar todas as mensagens"><span className="material-symbols-outlined">delete_sweep</span></button><HeaderProfileButton /></div>} />
       <main className="page messages-page">
-        <section className="messages-intro"><span className="eyebrow">Sua caixa de entrada</span></section>
         <label className="search-shell messages-search"><span className="material-symbols-outlined">search</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Pesquisar por pessoa ou mensagem..." /></label>
         <div className="thread-list">
-          {(visibleThreads.length ? visibleThreads : threads.length ? [] : [{ title: 'Ana Costa', subtitle: 'Olá! Tenho interesse nesse aparelho...', time: '14:20', unreadCount: 2 }]).map((thread) => (
+          {visibleThreads.map((thread) => (
             <button key={thread.id || thread.title} className="thread-card" onClick={() => onOpenThread(thread.id)}>
               <div className="thread-avatar" aria-label={`Perfil de ${thread.title || 'usuário'}`}>{thread.avatar ? <img src={thread.avatar} alt="" /> : <span className="material-symbols-outlined">person</span>}</div>
               <div className="thread-content">
@@ -691,12 +1054,15 @@ function ChatScreen({ onBack }) {
   const [text, setText] = useState('');
   const [messages, setMessages] = useState([]);
   const [thread, setThread] = useState(null);
+  const [clearingConversation, setClearingConversation] = useState(false);
   const sendMessage = useAppStore((state) => state.sendMessage);
+  const clearMessages = useAppStore((state) => state.clearMessages);
   const readThreadNotifications = useAppStore((state) => state.readThreadNotifications);
   const session = useAppStore((state) => state.session);
-  const threadId = new URLSearchParams(window.location.search).get('thread') || 'thread-ana-notebook';
+  const threadId = new URLSearchParams(window.location.search).get('thread');
 
   useEffect(() => {
+    if (!threadId) return undefined;
     let active = true;
     const refresh = async () => {
       try {
@@ -713,12 +1079,28 @@ function ChatScreen({ onBack }) {
     return () => { active = false; window.clearInterval(timer); };
   }, [threadId, readThreadNotifications]);
 
+  async function clearConversation() {
+    if (!threadId || clearingConversation || !window.confirm('Limpar esta conversa? O histórico dos outros participantes será preservado.')) return;
+    setClearingConversation(true);
+    try {
+      await clearMessages(threadId);
+      setMessages([]);
+      setThread((current) => current ? { ...current, unread_count: 0, last_message_at: null } : current);
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setClearingConversation(false);
+    }
+  }
+
   async function send() {
     if (!text.trim()) return;
+    if (!threadId) return;
     if (!session) {
       alert('Entre na sua conta para enviar mensagens.');
       return;
     }
+
     const messageText = text.trim();
     try {
       await sendMessage(threadId, { text: messageText });
@@ -734,12 +1116,25 @@ function ChatScreen({ onBack }) {
 
   return (
     <div className="chat-screen">
-      <header className="topbar compact-topbar chat-topbar"><button className="back-btn" onClick={onBack} aria-label="Voltar para mensagens"><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Conversa Direta</h1></header>
-      <div className="chat-banner">{thread?.avatar ? <img className="chat-person-avatar" src={thread.avatar} alt="" /> : <span className="chat-person-avatar material-symbols-outlined" aria-label={`Perfil de ${thread?.title || 'Ana Costa'}`}>person</span>}<div><strong>{thread?.title || 'Ana Costa'}</strong><span>Negocie com segurança e combine a retirada</span></div></div>
+      <UnifiedTopbar onBack={onBack} />
+      <div className="chat-banner">{thread?.avatar ? <img className="chat-person-avatar" src={thread.avatar} alt="" /> : <span className="chat-person-avatar material-symbols-outlined" aria-label={`Perfil de ${thread?.title || 'conversa'}`}>person</span>}<div><strong>{thread?.title || 'Conversa'}</strong><span>Negocie com segurança e combine a retirada</span></div><button className="icon-btn" type="button" onClick={clearConversation} disabled={clearingConversation} aria-busy={clearingConversation} aria-label="Limpar conversa" title="Limpar conversa"><span className="material-symbols-outlined">delete_sweep</span></button></div>
       <main className="chat-body">{messages.map((message) => { const mine = message.sender_id === session?.id; return <div key={message.id} className={mine ? 'bubble mine' : 'bubble'}><p>{message.text}</p><span>{formatBrazilTime(message.sent_at)}</span></div>; })}</main>
       <footer className="chat-compose"><textarea value={text} onChange={(e) => setText(e.target.value)} placeholder="Digite sua mensagem..." rows={1} /><button className="send-btn" onClick={send}><span className="material-symbols-outlined">send</span></button></footer>
     </div>
   );
+}
+
+function CreateCampaignScreen({ onBack, onSuccess }) {
+  const session = useAppStore((state) => state.session);
+  useEffect(() => { window.scrollTo(0, 0); }, []);
+  if (!session) return <Navigate to="/login" replace />;
+  return <div className="post-screen publish-screen campaign-create-screen">
+    <UnifiedTopbar onBack={onBack} />
+    <main className="page publish-page campaign-create-page">
+      <h1 className="campaign-page-title">Criar campanha</h1>
+      <CampaignCreateForm session={session} onCancel={onBack} onSuccess={onSuccess} />
+    </main>
+  </div>;
 }
 
 function CreatePostScreen({ onBack, onSuccess }) {
@@ -747,8 +1142,8 @@ function CreatePostScreen({ onBack, onSuccess }) {
   const postForm = useAppStore((state) => state.postForm);
   const setPostForm = useAppStore((state) => state.setPostForm);
   const session = useAppStore((state) => state.session);
-  const [image, setImage] = useState(null);
-  const [imagePreview, setImagePreview] = useState('');
+  const [media, setMedia] = useState([]);
+  const [publishing, setPublishing] = useState(false);
   const categories = [
     ['moveis', 'chair', 'Móveis'],
     ['eletronicos', 'devices', 'Eletrônicos'],
@@ -758,115 +1153,166 @@ function CreatePostScreen({ onBack, onSuccess }) {
     ['outros', 'category', 'Outros']
   ];
 
-  useEffect(() => {
-    if (!image) {
-      setImagePreview('');
-      return undefined;
-    }
-    const previewUrl = URL.createObjectURL(image);
-    setImagePreview(previewUrl);
-    return () => URL.revokeObjectURL(previewUrl);
-  }, [image]);
-
   async function submit(event) {
     event.preventDefault();
-    if (!postForm.title?.trim() || !postForm.description?.trim()) return;
-    if (!image) {
-      alert('Adicione uma foto do item para publicar o anúncio.');
+    if (publishing) return;
+    if (!postForm.title?.trim()) {
+      alert('Informe o título do item.');
       return;
     }
+    if (!postForm.description?.trim()) {
+      alert('Informe a descrição do item.');
+      return;
+    }
+    if (!media.length) {
+      alert('Adicione uma foto ou um vídeo do item para publicar o anúncio.');
+      return;
+    }
+    const selectedCategory = categories.find(([value]) => value === postForm.categoryId);
+    if (!selectedCategory) {
+      alert('Selecione a categoria do produto.');
+      return;
+    }
+    const [categoryId, , categoryLabel] = selectedCategory;
     const customCategory = String(postForm.customCategory || '').trim();
-    const category = postForm.category === 'outros' ? customCategory : (postForm.category || 'moveis');
+    const category = categoryId === 'outros' ? customCategory : categoryLabel;
     if (!category) {
       alert('Informe a categoria do produto.');
+      return;
+    }
+    if (!postForm.condition) {
+      alert('Selecione o estado do item.');
+      return;
+    }
+    if (!postForm.goal) {
+      alert('Selecione o tipo de publicação.');
+      return;
+    }
+    if (!postForm.location?.trim()) {
+      alert('Informe a localização aproximada do item.');
       return;
     }
     if (!session) {
       alert('Entre na sua conta para publicar um anúncio.');
       return;
     }
+    setPublishing(true);
     try {
-      const { customCategory: ignoredCustomCategory, ...postPayload } = postForm;
-      await createPost({ ...postPayload, category, image });
+      const { customCategory: ignoredCustomCategory, category: ignoredCategory, ...postPayload } = postForm;
+      await createPost({ ...postPayload, categoryId, category, images: media.filter((item) => item.kind === 'image').map((item) => item.file), videos: media.filter((item) => item.kind === 'video').map((item) => item.file) });
       setPostForm({});
-      setImage(null);
+      setMedia([]);
       onSuccess();
     } catch (error) {
       alert(error.message);
+      setPublishing(false);
     }
   }
 
   return (
     <div className="post-screen publish-screen">
-      <UnifiedTopbar />
+      <UnifiedTopbar onBack={onBack} />
       <main className="page publish-page">
         <section className="publish-hero">
           <span className="publish-hero-icon material-symbols-outlined">volunteer_activism</span>
           <div><span className="eyebrow">Dê um novo ciclo</span><h2>O que vai ganhar uma nova história?</h2><p>Capriche nos detalhes para encontrar a pessoa certa.</p></div>
         </section>
         <form onSubmit={submit} className="publish-form">
+          <p className="publish-required-note"><strong>*</strong> Campos obrigatórios</p>
           <section className="publish-section publish-photo-section">
-            <div className="publish-section-head"><div><span className="publish-step">01</span><h3>Mostre seu item</h3></div><span>Uma boa foto faz diferença</span></div>
-            <label className={imagePreview ? 'publish-image-picker has-image' : 'publish-image-picker'}>
-              {imagePreview ? <><img src={imagePreview} alt="Prévia do item" /><span className="publish-change-photo"><span className="material-symbols-outlined">edit</span>Trocar foto</span></> : <><span className="publish-image-icon material-symbols-outlined">add_a_photo</span><strong>Adicionar foto</strong><small>JPG, PNG, WebP ou GIF • até 5 MB</small></>}
-              <input type="file" accept="image/jpeg,image/png,image/gif,image/webp,image/avif" onChange={(event) => setImage(event.target.files?.[0] || null)} />
-            </label>
+            <div className="publish-section-head"><div><span className="publish-step">01</span><h3>Mostre seu item <strong className="required-mark" title="Campo obrigatório" aria-label="Campo obrigatório">*</strong></h3></div><span>Fotos e vídeos mostram os detalhes</span></div>
+            <PostMediaPicker items={media} onChange={setMedia} disabled={publishing} />
           </section>
 
           <section className="publish-section">
             <div className="publish-section-head"><div><span className="publish-step">02</span><h3>Conte sobre ele</h3></div><span>Seja direto e honesto</span></div>
             <div className="publish-fields">
-              <Field label="Título do item" icon="title" value={postForm.title || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, title: value }))} placeholder="Ex: Cadeira de madeira antiga" />
-              <Field label="Descrição" icon="description" value={postForm.description || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, description: value }))} placeholder="Estado, medidas e outros detalhes..." multiline />
+              <Field label="Título do item" icon="title" value={postForm.title || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, title: value }))} placeholder="Ex: Cadeira de madeira antiga" required />
+              <Field label="Descrição" icon="description" value={postForm.description || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, description: value }))} placeholder="Estado, medidas e outros detalhes..." multiline required />
             </div>
           </section>
 
           <section className="publish-section">
-            <div className="publish-section-head"><div><span className="publish-step">03</span><h3>Escolha a categoria</h3></div></div>
-            <div className="publish-categories">
-              {categories.map(([value, icon, label]) => <button type="button" key={value} className={(postForm.category || 'moveis') === value ? 'publish-category publish-category-active' : 'publish-category'} onClick={() => setPostForm((prev) => ({ ...prev, category: value }))} aria-pressed={(postForm.category || 'moveis') === value}><span className="material-symbols-outlined">{icon}</span><span>{label}</span></button>)}
+            <div className="publish-section-head"><div><span className="publish-step">03</span><h3>Escolha a categoria <strong className="required-mark" title="Campo obrigatório" aria-label="Campo obrigatório">*</strong></h3></div></div>
+            <div className="publish-categories" role="group" aria-label="Categoria do produto" aria-required="true">
+              {categories.map(([value, icon, label]) => <button type="button" key={value} className={postForm.categoryId === value ? 'publish-category publish-category-active' : 'publish-category'} onClick={() => setPostForm((prev) => ({ ...prev, categoryId: value, customCategory: value === 'outros' ? prev.customCategory : '' }))} aria-pressed={postForm.categoryId === value}><span className="material-symbols-outlined">{icon}</span><span>{label}</span></button>)}
             </div>
-            {postForm.category === 'outros' && <div className="publish-custom-category"><Field label="Qual é a categoria?" icon="sell" value={postForm.customCategory || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, customCategory: value }))} placeholder="Ex: Esportes, jardinagem, brinquedos..." maxLength={60} autoFocus /><small>Ela aparecerá no anúncio como a categoria do produto.</small></div>}
+            {postForm.categoryId === 'outros' && <div className="publish-custom-category"><Field label="Qual é a categoria?" icon="sell" value={postForm.customCategory || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, customCategory: value }))} placeholder="Ex: Esportes, jardinagem, brinquedos..." maxLength={60} required autoFocus /><small>Ela aparecerá no anúncio como a categoria do produto.</small></div>}
           </section>
 
           <section className="publish-section">
-            <div className="publish-section-head"><div><span className="publish-step">04</span><h3>Como está o item?</h3></div></div>
-            <div className="publish-options">
-              {['Novo', 'Bom estado', 'Marcas de uso', 'Para conserto'].map((condition) => <button type="button" key={condition} className={postForm.condition === condition || (!postForm.condition && condition === 'Novo') ? 'publish-option publish-option-active' : 'publish-option'} onClick={() => setPostForm((prev) => ({ ...prev, condition }))}>{condition}</button>)}
-            </div>
-          </section>
-
-          <section className="publish-section">
-            <div className="publish-section-head"><div><span className="publish-step">05</span><h3>Qual é a sua intenção?</h3></div></div>
-            <div className="publish-goals">
-              <button type="button" className={postForm.goal !== 'Troca' ? 'publish-goal publish-goal-active' : 'publish-goal'} onClick={() => setPostForm((prev) => ({ ...prev, goal: 'Doação' }))}><span className="material-symbols-outlined">volunteer_activism</span><span><strong>Doar</strong><small>Encontrar um novo lar</small></span></button>
-              <button type="button" className={postForm.goal === 'Troca' ? 'publish-goal publish-goal-active' : 'publish-goal'} onClick={() => setPostForm((prev) => ({ ...prev, goal: 'Troca' }))}><span className="material-symbols-outlined">swap_horiz</span><span><strong>Trocar</strong><small>Receber algo em troca</small></span></button>
+            <div className="publish-section-head"><div><span className="publish-step">04</span><h3>Como está o item? <strong className="required-mark" title="Campo obrigatório" aria-label="Campo obrigatório">*</strong></h3></div></div>
+            <div className="publish-options" role="group" aria-label="Estado do item" aria-required="true">
+              {['Novo', 'Bom estado', 'Marcas de uso', 'Para conserto'].map((condition) => <button type="button" key={condition} className={postForm.condition === condition ? 'publish-option publish-option-active' : 'publish-option'} onClick={() => setPostForm((prev) => ({ ...prev, condition }))} aria-pressed={postForm.condition === condition}>{condition}</button>)}
             </div>
           </section>
 
           <section className="publish-section">
-            <div className="publish-section-head"><div><span className="publish-step">06</span><h3>Onde ele está?</h3></div></div>
-            <Field label="Localização" icon="location_on" value={postForm.location || session?.city || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, location: value }))} placeholder="Ex: Santarém, PA" />
+            <div className="publish-section-head"><div><span className="publish-step">05</span><h3>Escolha o tipo de publicação <strong className="required-mark" title="Campo obrigatório" aria-label="Campo obrigatório">*</strong></h3></div></div>
+            <div className="publish-goals" role="group" aria-label="Tipo de publicação" aria-required="true">
+              <button type="button" className={postForm.goal === 'Doação' ? 'publish-goal publish-goal-active' : 'publish-goal'} onClick={() => setPostForm((prev) => ({ ...prev, goal: 'Doação' }))} aria-pressed={postForm.goal === 'Doação'}><span className="material-symbols-outlined">volunteer_activism</span><span><strong>Doar</strong><small>Encontrar um novo lar</small></span></button>
+              <button type="button" className={postForm.goal === 'Troca' ? 'publish-goal publish-goal-active' : 'publish-goal'} onClick={() => setPostForm((prev) => ({ ...prev, goal: 'Troca' }))} aria-pressed={postForm.goal === 'Troca'}><span className="material-symbols-outlined">swap_horiz</span><span><strong>Trocar</strong><small>Receber algo em troca</small></span></button>
+              <button type="button" className={postForm.goal === 'Venda' ? 'publish-goal publish-goal-active' : 'publish-goal'} onClick={() => setPostForm((prev) => ({ ...prev, goal: 'Venda' }))} aria-pressed={postForm.goal === 'Venda'}><span className="material-symbols-outlined">sell</span><span><strong>Vender</strong><small>Receber uma oferta em dinheiro</small></span></button>
+            </div>
           </section>
 
+          <section className="publish-section">
+            <div className="publish-section-head"><div><span className="publish-step">06</span><h3>Onde ele está? <strong className="required-mark" title="Campo obrigatório" aria-label="Campo obrigatório">*</strong></h3></div></div>
+            <Field label="Localização aproximada" icon="location_on" value={postForm.location || ''} onChange={(value) => setPostForm((prev) => ({ ...prev, location: value }))} placeholder="Ex: Santarém, PA" required />
+          </section>
+
+          <section className="publish-section"><h3>Retirada e transporte</h3><p>Ajude quem vai buscar o item a se organizar. Os campos com <strong className="required-mark">*</strong> são obrigatórios.</p><TransportFields value={postForm} onChange={setPostForm}/></section>
           <aside className="publish-tip"><span className="material-symbols-outlined">tips_and_updates</span><span><strong>Dica REUSA+</strong> Fotos claras e uma descrição sincera aumentam as chances de um novo encontro.</span></aside>
-          <div className="publish-submit"><button type="submit" className="primary-btn full">Publicar anúncio <span className="material-symbols-outlined">arrow_forward</span></button><small>Você poderá conversar com interessados depois da publicação.</small></div>
+          <div className="publish-submit"><button type="submit" className="primary-btn full" disabled={publishing} aria-busy={publishing}><span className="material-symbols-outlined">{publishing ? 'progress_activity' : 'arrow_forward'}</span>{publishing ? 'Publicando anúncio...' : 'Publicar anúncio'}</button><small>{publishing ? 'Aguarde enquanto salvamos seu anúncio.' : 'Você poderá conversar com interessados depois da publicação.'}</small></div>
         </form>
       </main>
     </div>
   );
 }
 
+function PostStatusControls({ post, deliveryLocked, statusUpdating, statusMessage, onChange }) {
+  const isAvailable = post.status === 'Disponível';
+  const isClosed = post.status === 'Encerrado';
+  const isUpdating = Boolean(statusUpdating);
+
+  return <div className="status-controls" aria-label="Status do anúncio">
+    <button type="button" className={isAvailable ? 'status-control status-control-available is-active' : 'status-control status-control-available'} onClick={() => onChange('Disponível')} disabled={isUpdating || isAvailable || deliveryLocked} aria-pressed={isAvailable} aria-busy={statusUpdating === 'Disponível'}>
+      <span className="material-symbols-outlined">{statusUpdating === 'Disponível' ? 'progress_activity' : 'check_circle'}</span>
+      {statusUpdating === 'Disponível' ? 'Reabrindo...' : isAvailable ? 'Disponível' : isClosed ? 'Reabrir' : 'Disponível'}
+    </button>
+    <button type="button" className={isClosed ? 'status-control status-control-closed is-active' : 'status-control status-control-closed'} onClick={() => onChange('Encerrado')} disabled={isUpdating || isClosed || deliveryLocked} aria-pressed={isClosed} aria-busy={statusUpdating === 'Encerrado'}>
+      <span className="material-symbols-outlined">{statusUpdating === 'Encerrado' ? 'progress_activity' : 'cancel'}</span>
+      {statusUpdating === 'Encerrado' ? 'Encerrando...' : isClosed ? 'Encerrado' : 'Encerrar'}
+    </button>
+    {post.status === 'Reservado' ? <p className="status-feedback">A conclusão acontece quando o destinatário confirma o recebimento em Coleta e entrega.</p> : null}
+    {statusMessage ? <p className="status-feedback" role="status" aria-live="polite"><span className="material-symbols-outlined">check_circle</span>{statusMessage}</p> : null}
+  </div>;
+}
+
 function PostDetailScreen({ postId, onBack, onNavigate }) {
+  const stripePixEnabled = useAppStore((state) => Boolean(state.profile?.user?.stripePixEnabled ?? state.session?.stripePixEnabled));
   const session = useAppStore((state) => state.session);
+  const paymentDemoMode = useAppStore((state) => Boolean(state.profile?.user?.stripeTestMode || state.profile?.user?.stripeDemoMode));
   const toggleFavorite = useAppStore((state) => state.toggleFavorite);
   const [post, setPost] = useState(null);
   const [comments, setComments] = useState([]);
   const [commentText, setCommentText] = useState('');
   const [interested, setInterested] = useState([]);
   const [negotiation, setNegotiation] = useState(null);
+  const [payment, setPayment] = useState(null);
+  const [paymentForm, setPaymentForm] = useState({ amount: '', method: 'card' });
+  const [paymentBusy, setPaymentBusy] = useState(false);
+  const [collection, setCollection] = useState(null);
+  const [proposalForm, setProposalForm] = useState({ amount: '', method: 'card' });
+  const [proposalBusy, setProposalBusy] = useState(false);
+  const [cancellingAcceptance, setCancellingAcceptance] = useState('');
+  const [cancellingOffer, setCancellingOffer] = useState(false);
+  const cancellingOfferRef = useRef(false);
+  const [offerError, setOfferError] = useState('');
   const [editing, setEditing] = useState(false);
   const [editForm, setEditForm] = useState({});
+  const [editMedia, setEditMedia] = useState([]);
+  const [editSaving, setEditSaving] = useState(false);
   const [reviewForm, setReviewForm] = useState({ rating: 5, comment: '' });
   const [reviewed, setReviewed] = useState(false);
   const [reportOpen, setReportOpen] = useState(false);
@@ -874,22 +1320,90 @@ function PostDetailScreen({ postId, onBack, onNavigate }) {
   const [reportReason, setReportReason] = useState('Spam');
   const [reportDetails, setReportDetails] = useState('');
   const [busy, setBusy] = useState(false);
-
-  const ownPost = post?.authorId === session?.id;
+  const [statusUpdating, setStatusUpdating] = useState('');
+  const [statusMessage, setStatusMessage] = useState('');
 
   useEffect(() => {
+    if (!negotiation?.id) return;
+    let active = true;
+    const sync = () => Promise.all([api.collection(negotiation.id), api.payment(negotiation.id), api.negotiation(postId), api.post(postId)]).then(([deliveryResult, paymentResult, negotiationResult, postResult]) => {
+      if (active) { setCollection(deliveryResult.collection); setPayment(paymentResult.payment); setNegotiation(negotiationResult.negotiation); setPost(postResult.post); }
+    }).catch(() => {});
+    const timer = window.setInterval(sync, 8000);
+    window.addEventListener('focus', sync);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener('focus', sync); };
+  }, [negotiation?.id]);
+
+  const ownPost = post?.authorId === session?.id;
+  const isSale = post?.goal === 'Venda';
+  useEffect(() => {
+    if (!ownPost || !interested.length) return;
+    let active = true;
+    const sync = () => api.interested(postId).then(result => { if (active) setInterested(result.negotiations || []); }).catch(() => {});
+    const timer = window.setInterval(sync, 8000);
+    window.addEventListener('focus', sync);
+    return () => { active = false; window.clearInterval(timer); window.removeEventListener('focus', sync); };
+  }, [ownPost, postId, Boolean(interested.length)]);
+
+
+  useEffect(() => {
+    setStatusUpdating('');
+    setStatusMessage('');
+    setOfferError('');
     setBusy(true);
     Promise.all([api.post(postId), api.comments(postId)]).then(([postResult, commentResult]) => {
       setPost(postResult.post);
       setEditForm({ title: postResult.post.title, description: postResult.post.description, category: postResult.post.category, condition: postResult.post.condition, goal: postResult.post.goal, location: postResult.post.location });
+      setEditMedia(postMediaItems(postResult.post));
       setComments(commentResult.comments || []);
     }).catch((error) => alert(error.message)).finally(() => setBusy(false));
-    if (session) api.negotiation(postId).then((result) => setNegotiation(result.negotiation)).catch(() => {});
+    if (session) api.negotiation(postId).then(async (result) => {
+      const currentNegotiation = result.negotiation;
+      setNegotiation(currentNegotiation);
+      if (currentNegotiation) {
+        if (currentNegotiation.status === 'reserved') {
+          setPaymentForm({
+            amount: currentNegotiation.proposalAmountCents
+              ? formatMoneyInput(String(currentNegotiation.proposalAmountCents))
+              : '',
+            method: currentNegotiation.proposalMethod || 'card'
+          });
+        }
+        const paymentResult = await api.payment(currentNegotiation.id);
+        setPayment(paymentResult.payment);
+        const collectionResult = await api.collection(currentNegotiation.id);
+        setCollection(collectionResult.collection);
+      }
+    }).catch(() => {});
   }, [postId, session?.id]);
+
+  function resetEditDraft(source = post) {
+    if (!source) return;
+    setEditForm({ title: source.title || '', description: source.description || '', category: source.category || '', condition: source.condition || '', goal: source.goal || '', location: source.location || '' });
+    setEditMedia(postMediaItems(source));
+  }
+
+  function openEdit() {
+    resetEditDraft();
+    setEditing(true);
+  }
+
+  function cancelEdit() {
+    resetEditDraft();
+    setEditing(false);
+  }
 
   async function refreshPost() {
     const result = await api.post(postId);
     setPost(result.post);
+    if (session) {
+      const current = (await api.negotiation(postId)).negotiation;
+      setNegotiation(current);
+      if (current) {
+        const [paymentResult, deliveryResult] = await Promise.all([api.payment(current.id), api.collection(current.id)]);
+        setPayment(paymentResult.payment); setCollection(deliveryResult.collection);
+      } else { setPayment(null); setCollection(null); }
+    }
   }
 
   async function startConversation() {
@@ -898,6 +1412,60 @@ function PostDetailScreen({ postId, onBack, onNavigate }) {
       const thread = await useAppStore.getState().createThread(post.id);
       onNavigate(`/mensagens/ana?thread=${thread.id}`);
     } catch (error) { alert(error.message); }
+  }
+
+  async function submitPayment(event) {
+    event.preventDefault();
+    if (!isSale || !negotiation || paymentBusy) return;
+    if (!collection?.paymentReady) return alert('Combine e aceite local e horário da entrega antes de pagar.');
+    // The accepted proposal is authoritative: buyers cannot change its amount or method at checkout.
+    const amountCents = Number(negotiation.proposalAmountCents);
+    const method = negotiation.proposalMethod;
+    if (negotiation.proposalStatus !== 'accepted' || !Number.isSafeInteger(amountCents) || amountCents < 100 ||
+        !['pix', 'card'].includes(method)) {
+      return alert('A proposta aceita está incompleta ou desatualizada. Atualize a página e confira a negociação.');
+    }
+    setPaymentBusy(true);
+    try {
+      const result = await api.createPayment(negotiation.id, {
+        amountCents,
+        currency: 'BRL',
+        method,
+        idempotencyKey: collection.paymentAttemptKey || `web-${session.id}-${negotiation.id}-${Date.now()}`
+      });
+      setPayment(result.payment);
+      if (result.payment.checkoutUrl) {
+        window.location.assign(result.payment.checkoutUrl);
+        return;
+      }
+      if (result.payment.method !== 'pix' || !result.payment.pix) {
+        alert(result.payment.status === 'succeeded' ? 'Pagamento confirmado.' : 'Pagamento aguardando confirmação.');
+      }
+    } catch (error) {
+      try { setCollection((await api.collection(negotiation.id)).collection); } catch {}
+      alert(error.message);
+    } finally {
+      setPaymentBusy(false);
+    }
+  }
+
+  async function submitProposal(event) {
+      event.preventDefault();
+      if (!isSale || !negotiation || proposalBusy) return;
+      const amountCents = Number(String(proposalForm.amount).replace(/\D/g, ''));
+      if (!Number.isSafeInteger(amountCents) || amountCents < 100) return alert('Informe um valor válido a partir de R$ 1,00.');
+      setProposalBusy(true);
+      setOfferError('');
+      try {
+        const result = await api.createProposal(negotiation.id, { amountCents, method: proposalForm.method });
+        setNegotiation((current) => ({ ...current, status: 'interested', canCancelOffer: false, proposalStatus: result.proposal.status, proposalAmountCents: result.proposal.amountCents, proposalMethod: result.proposal.method, proposalCreatedAt: result.proposal.createdAt }));
+        await refreshPost();
+        alert('Proposta enviada. Aguarde a resposta do vendedor.');
+      } catch (error) {
+        alert(error.message);
+      } finally {
+        setProposalBusy(false);
+    }
   }
 
   async function save() {
@@ -951,21 +1519,87 @@ function PostDetailScreen({ postId, onBack, onNavigate }) {
     try { const result = await api.interested(post.id); setInterested(result.negotiations || []); } catch (error) { alert(error.message); }
   }
 
+  function canCancelAcceptedOffer(item) {
+    return item.canCancelAcceptance && !(item.id === negotiation?.id && (collection || payment));
+  }
+
+  async function cancelOwnOffer() {
+    if (cancellingOfferRef.current || !negotiation?.canCancelOffer || negotiation.interestedId !== session?.id) return;
+    cancellingOfferRef.current = true;
+    setCancellingOffer(true);
+    setOfferError('');
+    let cancelled = false;
+    try {
+      await api.cancelOffer(negotiation.id, negotiation.proposalCreatedAt);
+      cancelled = true;
+      setNegotiation((current) => ({ ...current, status: 'cancelled', proposalStatus: 'cancelled', canCancelOffer: false }));
+      setProposalForm((current) => ({ ...current, amount: '' }));
+      await refreshPost();
+    } catch (error) {
+      if (!cancelled) await refreshPost().catch(() => {});
+      setOfferError(cancelled ? 'A oferta foi cancelada, mas não foi possível atualizar todos os dados. Atualize a página para conferir.' : error.message);
+    } finally {
+      cancellingOfferRef.current = false;
+      setCancellingOffer(false);
+    }
+  }
+
+  async function cancelAcceptance(id) {
+    if (cancellingAcceptance || !window.confirm('Cancelar o aceite? O item ficará disponível para aceitar outra oferta.')) return;
+    setCancellingAcceptance(id);
+    try { await api.cancelAcceptedProposal(id); await refreshPost(); await loadInterested(); }
+    catch (error) { await loadInterested().catch(() => {}); alert(error.message); }
+    finally { setCancellingAcceptance(''); }
+  }
+
   async function reserve(interestedId) {
     try { await useAppStore.getState().reservePost(post.id, interestedId); await refreshPost(); await loadInterested(); } catch (error) { alert(error.message); }
   }
 
-  async function complete(outcome) {
-    if (!window.confirm(`Confirmar que o item foi ${outcome.toLowerCase()}?`)) return;
-    try { await useAppStore.getState().completePost(post.id, outcome); await refreshPost(); alert('Negociação concluída. As avaliações foram liberadas.'); } catch (error) { alert(error.message); }
+  async function decideOffer(item, decision) {
+    try {
+      await api.decideProposal(item.id, decision, item.proposalCreatedAt);
+    } catch (error) {
+      alert(error.message);
+    }
+    try { await refreshPost(); } catch (error) { alert(error.message); }
+    await loadInterested();
+  }
+
+  async function updateStatus(status) {
+    if (statusUpdating || post.status === status) return;
+    if (status === 'Encerrado' && post.status === 'Reservado' && !window.confirm('Encerrar este anúncio manterá a reserva atual. Deseja continuar?')) return;
+    setStatusUpdating(status);
+    setStatusMessage('');
+    try {
+      const updatedPost = await useAppStore.getState().updatePostStatus(post.id, status);
+      setPost(updatedPost);
+      setStatusMessage(status === 'Encerrado' ? 'Anúncio encerrado.' : 'Anúncio disponível novamente.');
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setStatusUpdating('');
+    }
   }
 
   async function saveEdit(event) {
     event.preventDefault();
+    if (editSaving) return;
+    if (!editMedia.length) {
+      alert('O anúncio precisa ter pelo menos uma foto ou um vídeo.');
+      return;
+    }
+    setEditSaving(true);
     try {
-      const updated = await useAppStore.getState().updatePost(post.id, editForm);
+      const images = editMedia.filter((item) => item.kind === 'image');
+      const videos = editMedia.filter((item) => item.kind === 'video');
+      const newImages = images.filter((item) => item.file).map((item) => item.file);
+      const newVideos = videos.filter((item) => item.file).map((item) => item.file);
+      const imageOrder = images.map((item) => item.file ? `new:${newImages.indexOf(item.file)}` : `existing:${item.url}`);
+      const videoOrder = videos.map((item) => item.file ? `new:${newVideos.indexOf(item.file)}` : `existing:${item.url}`);
+      const updated = await useAppStore.getState().updatePost(post.id, { ...editForm, images: newImages, videos: newVideos, imageOrder, videoOrder });
       setPost(updated); setEditing(false);
-    } catch (error) { alert(error.message); }
+    } catch (error) { alert(error.message); } finally { setEditSaving(false); }
   }
 
   async function removeOwnedPost() {
@@ -983,11 +1617,86 @@ function PostDetailScreen({ postId, onBack, onNavigate }) {
 
   if (busy || !post) return <div className="loading-stage"><span className="material-symbols-outlined">recycling</span><p>Carregando anúncio...</p></div>;
 
-  return <div className="detail-screen"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack} aria-label="Voltar"><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Anúncio</h1><button className="icon-btn" onClick={share} aria-label="Compartilhar"><span className="material-symbols-outlined">ios_share</span></button></header><main className="detail-page">
-    <section className="detail-image"><img src={post.imageUrl} alt={post.title} /><span className={`status-tag status-${String(post.status || 'Disponível').toLowerCase().replace(/\s+/g, '-')}`}>{post.status || 'Disponível'}</span></section>
-    <section className="detail-summary"><div className="detail-kicker"><span>{post.category}</span><span>{post.condition}</span></div><h1>{post.title}</h1><p>{post.description}</p><div className="detail-info"><span><i className="material-symbols-outlined">swap_horiz</i>{post.goal}</span><span><i className="material-symbols-outlined">location_on</i>{post.location}</span><span><i className="material-symbols-outlined">schedule</i>{formatBrazilDate(post.createdAt)} às {formatBrazilTime(post.createdAt)}</span></div><div className="detail-actions"><button className={post.saved ? 'secondary-btn saved-btn' : 'secondary-btn'} onClick={save} title={post.saved ? 'Remover dos salvos' : 'Salvar anúncio'} aria-label={post.saved ? 'Remover dos salvos' : 'Salvar anúncio'}><span className="material-symbols-outlined">{post.saved ? 'bookmark' : 'bookmark_border'}</span>{post.saved ? 'Salvo' : 'Salvar'}</button><button className="secondary-btn" onClick={share} title="Compartilhar anúncio" aria-label="Compartilhar anúncio"><span className="material-symbols-outlined">share</span>Compartilhar</button>{!ownPost ? <button className="primary-btn" disabled={post.status !== 'Disponível'} onClick={startConversation}><span className="material-symbols-outlined">handshake</span>Tenho interesse</button> : null}</div></section>
+  return <div className="detail-screen"><UnifiedTopbar onBack={onBack} /><main className="detail-page">
+    <section className="detail-image"><PostMediaGallery post={post} /><span className={`status-tag status-${String(post.status || 'Disponível').toLowerCase().replace(/\s+/g, '-')}`}>{post.status || 'Disponível'}</span></section>
+    <section className="detail-summary"><div className="detail-kicker"><span>{post.category}</span><span>{post.condition}</span></div><h1>{post.title}</h1><p>{post.description}</p><div className="detail-info"><span><i className="material-symbols-outlined">{post.goal === 'Venda' ? 'sell' : post.goal === 'Troca' ? 'swap_horiz' : 'volunteer_activism'}</i>{post.goal}</span><span><i className="material-symbols-outlined">location_on</i>{post.location}</span><span><i className="material-symbols-outlined">schedule</i>{formatBrazilDate(post.createdAt)} às {formatBrazilTime(post.createdAt)}</span></div><div className="detail-actions"><button className={post.saved ? 'secondary-btn saved-btn' : 'secondary-btn'} onClick={save} title={post.saved ? 'Remover dos salvos' : 'Salvar anúncio'} aria-label={post.saved ? 'Remover dos salvos' : 'Salvar anúncio'}><span className="material-symbols-outlined">{post.saved ? 'bookmark' : 'bookmark_border'}</span>{post.saved ? 'Salvo' : 'Salvar'}</button><button className="secondary-btn" onClick={share} title="Compartilhar anúncio" aria-label="Compartilhar anúncio"><span className="material-symbols-outlined">share</span>Compartilhar</button>{!ownPost ? <button className="primary-btn" disabled={post.status !== 'Disponível'} onClick={startConversation}><span className="material-symbols-outlined">handshake</span>Tenho interesse</button> : null}</div></section>
     <section className="detail-owner"><div>{post.author.avatar ? <img src={post.author.avatar} alt={post.author.name} /> : <span className="avatar-placeholder material-symbols-outlined">person</span>}</div><div><span>Anunciante</span><h2>{post.author.name}</h2><p>{post.author.city} · {post.authorReputation ? `⭐ ${post.authorReputation.toFixed(1)} (${post.authorReviewCount})` : 'Novo na comunidade'}</p></div>{!ownPost ? <div className="owner-actions"><button className="text-btn" onClick={blockAuthor} title="Bloquear anunciante" aria-label="Bloquear anunciante">Bloquear</button><button className="text-btn" onClick={() => openReport('user', post.authorId)} title="Denunciar anunciante" aria-label="Denunciar anunciante">Denunciar</button></div> : null}</section>
-    {ownPost ? <section className="owner-management"><div className="section-title"><div><span className="eyebrow">Gerenciar anúncio</span><h2>Negociação e status</h2></div><div><button className="text-btn" onClick={() => setEditing((value) => !value)}>Editar</button><button className="secondary-btn" onClick={loadInterested}>Interessados ({post.interestedCount || 0})</button><button className="text-btn danger-text" onClick={removeOwnedPost}>Excluir</button></div></div>{editing ? <form className="edit-post-form" onSubmit={saveEdit}><Field label="Título" icon="title" value={editForm.title || ''} onChange={(value) => setEditForm((current) => ({ ...current, title: value }))} /><Field label="Descrição" icon="description" multiline value={editForm.description || ''} onChange={(value) => setEditForm((current) => ({ ...current, description: value }))} /><Field label="Categoria" icon="category" value={editForm.category || ''} onChange={(value) => setEditForm((current) => ({ ...current, category: value }))} /><Field label="Localização aproximada" icon="location_on" value={editForm.location || ''} onChange={(value) => setEditForm((current) => ({ ...current, location: value }))} /><button className="primary-btn">Salvar edição</button></form> : null}<div className="status-controls"><button onClick={() => useAppStore.getState().updatePostStatus(post.id, 'Disponível').then(setPost).catch((error) => alert(error.message))}>Disponível</button><button onClick={() => useAppStore.getState().updatePostStatus(post.id, 'Encerrado').then(setPost).catch((error) => alert(error.message))}>Encerrar</button>{post.status === 'Reservado' ? <><button onClick={() => complete('Doado')}>Marcar doado</button><button onClick={() => complete('Trocado')}>Marcar trocado</button></> : null}</div>{interested.length ? <div className="interested-list">{interested.map((item) => <article key={item.id}><span className="avatar-placeholder material-symbols-outlined">person</span><div><strong>{item.user?.name || 'Usuário'}</strong><small>{item.user?.city} · {item.status}</small></div>{post.status === 'Disponível' || post.status === 'Reservado' ? <button className="secondary-btn" onClick={() => reserve(item.user.id)}>Reservar</button> : null}</article>)}</div> : null}</section> : null}
+    {ownPost ? (
+      <section className="owner-management">
+        <div className="section-title">
+          <div><span className="eyebrow">Gerenciar anúncio</span><h2>Negociação e status</h2></div>
+          <div className="owner-management-actions">
+            <button type="button" className="text-btn" onClick={editing ? cancelEdit : openEdit}>{editing ? 'Cancelar edição' : 'Editar'}</button>
+            <button type="button" className="secondary-btn" onClick={loadInterested}>Interessados ({post.interestedCount || 0})</button>
+            <button type="button" className="text-btn danger-text" onClick={removeOwnedPost}>Excluir</button>
+          </div>
+        </div>
+        {editing ? (
+          <form className="edit-post-form" onSubmit={saveEdit}>
+            <header className="edit-post-form-header">
+              <div>
+                <span className="eyebrow">Edição do anúncio</span>
+                <h3>Atualize seu anúncio</h3>
+                <p>Revise fotos, vídeos e informações antes de salvar as alterações.</p>
+              </div>
+              <button type="button" className="edit-close-btn" onClick={cancelEdit} disabled={editSaving} aria-label="Cancelar edição" title="Cancelar edição"><span className="material-symbols-outlined">close</span></button>
+            </header>
+            <section className="edit-form-section edit-media-section">
+              <div className="edit-section-heading">
+                <span className="edit-section-icon material-symbols-outlined">photo_library</span>
+                <div><span className="eyebrow">Fotos e vídeos</span><h3>Mostre o item por todos os ângulos</h3><p>A primeira foto será a capa. Se houver apenas vídeos, eles poderão ser reproduzidos no anúncio.</p></div>
+              </div>
+              <PostMediaPicker items={editMedia} onChange={setEditMedia} disabled={editSaving} />
+            </section>
+            <section className="edit-form-section edit-details-section">
+              <div className="edit-section-heading">
+                <span className="edit-section-icon material-symbols-outlined">edit_note</span>
+                <div><span className="eyebrow">Informações</span><h3>Conte sobre o item</h3><p>Informações claras ajudam a comunidade a decidir.</p></div>
+              </div>
+              <div className="edit-fields-grid">
+                <div className="edit-field-wide"><Field label="Título" icon="title" value={editForm.title || ''} maxLength={140} onChange={(value) => setEditForm((current) => ({ ...current, title: value }))} /></div>
+                <div className="edit-field-wide"><Field label="Descrição" icon="description" multiline value={editForm.description || ''} maxLength={3000} onChange={(value) => setEditForm((current) => ({ ...current, description: value }))} /></div>
+                <Field label="Categoria" icon="category" value={editForm.category || ''} maxLength={60} onChange={(value) => setEditForm((current) => ({ ...current, category: value }))} />
+                <Field label="Localização aproximada" icon="location_on" value={editForm.location || ''} maxLength={160} onChange={(value) => setEditForm((current) => ({ ...current, location: value }))} />
+              </div>
+              <p className="edit-form-hint"><span className="material-symbols-outlined">info</span>Use uma localização aproximada para preservar sua privacidade.</p>
+            </section>
+            <footer className="edit-form-actions">
+              <button type="button" className="ghost-btn" onClick={cancelEdit} disabled={editSaving}>Cancelar</button>
+              <button className="primary-btn" disabled={editSaving}><span className="material-symbols-outlined">save</span>{editSaving ? 'Salvando alterações...' : 'Salvar alterações'}</button>
+            </footer>
+          </form>
+        ) : null}
+        <PostStatusControls post={post} deliveryLocked={Boolean((collection && collection.status !== 'cancelled') || ['processing','succeeded'].includes(payment?.status))} statusUpdating={statusUpdating} statusMessage={statusMessage} onChange={updateStatus} />
+        {interested.length ? <div className="interested-list">{interested.map((item) => <article key={item.id}>{item.user?.avatar ? <img className="interested-avatar" src={item.user.avatar} alt={`Foto de ${item.user.name || 'usuário'}`} /> : <span className="avatar-placeholder material-symbols-outlined">person</span>}<div><strong>{item.user?.name || 'Usuário'}</strong><small>{item.user?.city} · {negotiationStatusLabel(item.status)}</small>{item.proposalStatus !== 'none' ? <small>Proposta: {Number.isFinite(Number(item.proposalAmountCents)) && Number(item.proposalAmountCents) > 0 ? `R$ ${(Number(item.proposalAmountCents) / 100).toFixed(2).replace('.', ',')}` : 'Valor indisponível'} · {proposalStatusLabel(item.proposalStatus)}</small> : null}</div>{isSale ? (
+            (item.proposalStatus === 'pending' || (item.proposalStatus === 'rejected' && post.status === 'Disponível')) ? <div className="offer-decision-actions">
+              {item.proposalStatus === 'pending' && <button type="button" className="ghost-btn reject-offer-btn" onClick={() => decideOffer(item, 'rejected')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m9 9 6 6m0-6-6 6"/></svg><span>Recusar oferta</span></button>}
+              <button type="button" className="primary-btn" disabled={post.status !== 'Disponível' || Boolean(cancellingAcceptance)} title={post.status !== 'Disponível' ? 'Cancele o aceite atual antes de aceitar outra oferta' : undefined} onClick={() => decideOffer(item, 'accepted')}><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><circle cx="12" cy="12" r="9"/><path d="m8 12 3 3 5-6"/></svg><span>{item.proposalStatus === 'rejected' ? 'Reconsiderar oferta' : 'Aceitar oferta e reservar'}</span></button>
+            </div> : item.proposalStatus === 'accepted' && item.status === 'reserved' ? <div className="accepted-offer-actions"><span className="reserve-btn reserve-btn-active"><span className="material-symbols-outlined" aria-hidden="true">check_circle</span>Oferta aceita · Item reservado</span><button type="button" className="cancel-acceptance-btn" disabled={!canCancelAcceptedOffer(item) || Boolean(cancellingAcceptance)} onClick={() => cancelAcceptance(item.id)} title={canCancelAcceptedOffer(item) ? 'Retirar o aceite e liberar o item para outra oferta' : 'Indisponível: a negociação já avançou para entrega ou pagamento'}>{cancellingAcceptance === item.id ? 'Cancelando…' : 'Cancelar aceite'}</button>{!canCancelAcceptedOffer(item) && <small>A negociação já avançou para entrega ou pagamento.</small>}</div> : null
+          ) : (
+            item.status === 'reserved'
+              ? <span className="reserve-btn reserve-btn-active"><span className="material-symbols-outlined">check_circle</span>Item reservado</span>
+              : item.status === 'interested'
+                ? <button className="reserve-btn" onClick={() => reserve(item.user.id)}><span className="material-symbols-outlined">bookmark_add</span>Reservar para este usuário</button>
+                : null
+          )}</article>)}</div> : null}
+      </section>
+    ) : null}
+    <section className="detail-community-grid">
+      <TransportPanel key={post.id} post={post} own={ownPost} onSaved={refreshPost}/>
+      <Questions post={post} session={session}/>
+    </section>
+    {!ownPost && isSale && offerError ? <p className="offer-cancellation-error" role="alert">{offerError}</p> : null}
+    {!ownPost && isSale && post.status === 'Disponível' && negotiation && ((negotiation.status === 'interested' && negotiation.proposalStatus === 'none') || (negotiation.status === 'cancelled' && negotiation.proposalStatus === 'cancelled')) ? <section className="review-form-card proposal-card"><span className="eyebrow">Oferta com pagamento</span><h2>{negotiation.proposalStatus === 'cancelled' ? 'Envie uma nova proposta' : 'Envie sua proposta'}</h2><p>Informe o valor e a forma de pagamento. O vendedor receberá sua proposta para análise.</p><form onSubmit={submitProposal}><label>Valor da oferta (R$)<input inputMode="decimal" value={proposalForm.amount} onChange={(event) => setProposalForm((current) => ({ ...current, amount: formatMoneyInput(event.target.value) }))} placeholder="10,00" required /></label>    <label>Forma de pagamento<select value={proposalForm.method} onChange={(event) => setProposalForm((current) => ({ ...current, method: event.target.value }))}><option value="card">Cartão</option><option value="pix" disabled={!stripePixEnabled}>PIX{stripePixEnabled ? "" : " (indisponível)"}</option></select></label><button className="primary-btn" disabled={proposalBusy}>{proposalBusy ? 'Enviando...' : 'Enviar proposta'}<span className="material-symbols-outlined">send</span></button></form></section> : null}
+    {!ownPost && isSale && negotiation?.status === 'interested' && negotiation.proposalStatus === 'pending' ? <section className="payment-waiting-card"><div className="payment-waiting-icon"><span className="material-symbols-outlined">hourglass_top</span></div><div><span className="eyebrow">Proposta enviada</span><h2>Aguardando resposta do vendedor</h2><p>Sua oferta de R$ {((negotiation.proposalAmountCents || 0) / 100).toFixed(2).replace('.', ',')} foi enviada. O pagamento ficará disponível após o vendedor aceitar a oferta e as duas pessoas combinarem e aceitarem a entrega.</p></div><div className="payment-waiting-actions"><button className="secondary-btn" onClick={startConversation}><span className="material-symbols-outlined">chat_bubble</span>Conversar com o anunciante</button>{negotiation.canCancelOffer && negotiation.interestedId === session?.id && !collection && !payment ? <button type="button" className="cancel-offer-btn" disabled={cancellingOffer} onClick={cancelOwnOffer}>{cancellingOffer ? 'Cancelando…' : 'Cancelar oferta'}</button> : null}</div></section> : null}
+    {negotiation && (['reserved','completed'].includes(negotiation.status) || payment) ? <DeliveryCard negotiation={negotiation} collection={collection} onChange={setCollection} isSale={isSale} payment={payment} testMode={payment?.testMode ?? paymentDemoMode} isOwner={ownPost} onRefreshStatus={refreshPost} onReceived={refreshPost} onChat={() => onNavigate(`/mensagens/ana?thread=${negotiation.threadId || negotiation.thread_id}`)}>
+    {!ownPost && isSale && negotiation?.status === 'reserved' && negotiation.proposalMethod === 'pix' && !stripePixEnabled && (!payment || payment.status === 'failed') && <section className="delivery-payment"><h3>Atualize a forma de pagamento</h3><p>Pix não está disponível. Você pode reenviar o mesmo valor por cartão. A reserva e o acordo anteriores serão cancelados; o vendedor precisará aceitar novamente.</p><button className="primary-btn" disabled={paymentBusy} onClick={async()=>{if(!window.confirm('Reenviar a oferta por cartão e aguardar um novo aceite?'))return;setPaymentBusy(true);try{await api.switchOfferToCard(negotiation.id);await refreshPost();}catch(error){alert(error.message);}finally{setPaymentBusy(false);}}}>Reenviar oferta por cartão</button></section>}
+    {!ownPost && isSale && negotiation?.status === 'reserved' && negotiation?.proposalStatus === 'accepted' && (!payment || ['failed', 'refunded'].includes(payment.status) || ['requested', 'pending', 'requires_action'].includes(payment.refundStatus)) && (negotiation.proposalMethod !== 'pix' || stripePixEnabled) ? <section className="delivery-payment"><h3>{collection?.paymentReady ? 'Finalize seu pagamento' : 'Pagamento ainda bloqueado'}</h3><p>{collection?.paymentReady ? 'Local e horário foram aceitos pelas duas pessoas. Confira o item antes de pagar; o recebimento será confirmado separadamente.' : 'O aceite da oferta reserva o item. Para pagar, as duas pessoas também precisam aceitar o local e o horário acima.'}</p>{paymentDemoMode ? <p role="status"><strong>Ambiente de teste:</strong> o pagamento é simulado e não transfere dinheiro real ao vendedor. Para cartão, use somente dados de teste do Stripe; o Pix só estará disponível se a Stripe habilitar essa forma de pagamento.</p> : null}<form onSubmit={submitPayment}><button className="primary-btn" disabled={paymentBusy || !collection?.paymentReady}>{paymentBusy ? 'Abrindo checkout...' : 'Continuar para pagamento'}<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true"><rect x="3" y="5" width="18" height="14" rx="3"/><path d="M3 10h18m-13 5h3"/></svg></button></form></section> : null}
+    {!ownPost && isSale && payment && (paymentDemoMode || (payment.status === 'processing' && collection?.paymentReady && (payment.checkoutUrl || payment.method === 'pix'))) ? <section className="delivery-payment delivery-payment-status">
+      {paymentDemoMode ? <p>Simulação: nenhum valor real é transferido ao vendedor.</p> : null}
+      {payment.status === 'processing' && payment.checkoutUrl && collection?.paymentReady ? <a className="secondary-btn" href={payment.checkoutUrl}>Abrir checkout</a> : null}
+    </section> : null}
+    </DeliveryCard> : null}
     {negotiation?.status === 'completed' && !reviewed ? <section className="review-form-card"><span className="eyebrow">Negociação concluída</span><h2>Como foi a experiência?</h2><form onSubmit={submitReview}><label>Nota<select value={reviewForm.rating} onChange={(event) => setReviewForm((current) => ({ ...current, rating: Number(event.target.value) }))}>{[5, 4, 3, 2, 1].map((rating) => <option key={rating} value={rating}>{'⭐'.repeat(rating)} ({rating})</option>)}</select></label><textarea value={reviewForm.comment} onChange={(event) => setReviewForm((current) => ({ ...current, comment: event.target.value }))} maxLength="500" placeholder="Comentário opcional" /><button className="primary-btn">Enviar avaliação</button></form></section> : null}
     <section className="detail-comments"><div className="section-title"><h2>Comentários ({post.comments || 0})</h2></div>{comments.length ? comments.map((comment) => <article className="detail-comment" key={comment.id}><span className="avatar-placeholder material-symbols-outlined">person</span><div><strong>{comment.name}</strong><p>{comment.text}</p></div><button className="text-btn" onClick={() => openReport('comment', comment.id)}>Denunciar</button></article>) : <EmptyState icon="chat_bubble" title="Ainda não há comentários" text="Seja a primeira pessoa a conversar sobre este item." /> }<form className="comment-form" onSubmit={submitComment}><input value={commentText} onChange={(event) => setCommentText(event.target.value)} maxLength="500" placeholder="Escreva um comentário..." /><button className="send-btn" aria-label="Enviar comentário"><span className="material-symbols-outlined">send</span></button></form></section>
     {reportOpen ? <form className="report-panel" onSubmit={submitReport}><h2>Denunciar anúncio</h2><select value={reportReason} onChange={(event) => setReportReason(event.target.value)}>{['Spam', 'Informação falsa', 'Conteúdo impróprio', 'Tentativa de golpe', 'Material proibido', 'Comportamento ofensivo', 'Outro'].map((reason) => <option key={reason}>{reason}</option>)}</select><textarea value={reportDetails} onChange={(event) => setReportDetails(event.target.value)} maxLength="1000" placeholder="Conte mais detalhes (opcional)" /><div><button type="button" className="secondary-btn" onClick={() => setReportOpen(false)}>Cancelar</button><button className="primary-btn">Enviar denúncia</button></div></form> : null}
@@ -1001,7 +1710,7 @@ function SavedItemsScreen({ onBack, onOpenPost }) {
   const [busy, setBusy] = useState(true);
   useEffect(() => { loadFavorites().catch((error) => alert(error.message)).finally(() => setBusy(false)); }, [loadFavorites]);
   if (busy) return <div className="loading-stage"><span className="material-symbols-outlined">bookmark</span></div>;
-  return <div className="subpage"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Itens salvos</h1><span /></header><main className="page saved-page">{favorites.length ? <div className="saved-list">{favorites.map((post) => <article className="saved-item" key={post.id}><img src={post.imageUrl} alt={post.title} /><div><span>{post.status}</span><h2>{post.title}</h2><p>{post.location}</p><div><button className="text-btn" onClick={() => onOpenPost(post.id)}>Ver anúncio</button><button className="text-btn" onClick={() => toggleFavorite(post.id)}>Remover</button></div></div></article>)}</div> : <EmptyState icon="bookmark_border" title="Nenhum item salvo" text="Salve anúncios para encontrá-los rapidamente depois." action="Explorar anúncios" onAction={() => window.location.assign('/feed')} />}</main></div>;
+  return <div className="subpage"><UnifiedTopbar onBack={onBack} /><main className="page saved-page">{favorites.length ? <div className="saved-list">{favorites.map((post) => <article className="saved-item" key={post.id}><img src={post.imageUrl} alt={post.title} /><div><span>{post.status}</span><h2>{post.title}</h2><p>{post.location}</p><div><button className="text-btn" onClick={() => onOpenPost(post.id)}>Ver anúncio</button><button className="text-btn" onClick={() => toggleFavorite(post.id)}>Remover</button></div></div></article>)}</div> : <EmptyState icon="bookmark_border" title="Nenhum item salvo" text="Salve anúncios para encontrá-los rapidamente depois." action="Explorar anúncios" onAction={() => window.location.assign('/feed')} />}</main></div>;
 }
 
 function MyPostsScreen({ onBack, onOpenPost }) {
@@ -1010,15 +1719,17 @@ function MyPostsScreen({ onBack, onOpenPost }) {
   const [tab, setTab] = useState('Ativos');
   useEffect(() => { loadProfile().catch((error) => alert(error.message)); }, [loadProfile]);
   const posts = profile?.posts || [];
-  const visible = posts.filter((post) => tab === 'Ativos' ? post.status === 'Disponível' : tab === 'Reservados' ? post.status === 'Reservado' : ['Doado', 'Trocado', 'Encerrado'].includes(post.status));
-  return <div className="subpage"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Meus anúncios</h1><span /></header><main className="page my-posts-page"><div className="segmented-tabs">{['Ativos', 'Reservados', 'Concluídos'].map((item) => <button className={tab === item ? 'active' : ''} key={item} onClick={() => setTab(item)}>{item}</button>)}</div>{visible.length ? <div className="saved-list">{visible.map((post) => <article className="saved-item" key={post.id}><img src={post.imageUrl} alt={post.title} /><div><span className={`status-tag status-${String(post.status).toLowerCase()}`}>{post.status}</span><h2>{post.title}</h2><p>{post.likes} curtidas · {post.comments} comentários · {post.views || 0} visualizações</p><button className="text-btn" onClick={() => onOpenPost(post.id)}>Gerenciar anúncio</button></div></article>)}</div> : <EmptyState icon="inventory_2" title="Você ainda não possui anúncios nesta seção" text="Publique um item e encontre quem pode dar a ele uma nova história." action="Criar publicação" onAction={() => window.location.assign('/nova-publicacao')} />}</main></div>;
+  const visible = posts.filter((post) => tab === 'Ativos' ? post.status === 'Disponível' : tab === 'Reservados' ? post.status === 'Reservado' : ['Doado', 'Trocado', 'Vendido', 'Encerrado'].includes(post.status));
+  return <div className="subpage"><UnifiedTopbar onBack={onBack} /><main className="page my-posts-page"><div className="segmented-tabs">{['Ativos', 'Reservados', 'Concluídos'].map((item) => <button className={tab === item ? 'active' : ''} key={item} onClick={() => setTab(item)}>{item}</button>)}</div>{visible.length ? <div className="saved-list">{visible.map((post) => <article className="saved-item" key={post.id}><img src={post.imageUrl} alt={post.title} /><div><span className={`status-tag status-${String(post.status).toLowerCase()}`}>{post.status}</span><h2>{post.title}</h2><p>{post.likes} curtidas · {post.comments} comentários · {post.views || 0} visualizações</p><button className="text-btn" onClick={() => onOpenPost(post.id)}>Gerenciar anúncio</button></div></article>)}</div> : <EmptyState icon="inventory_2" title="Você ainda não possui anúncios nesta seção" text="Publique um item e encontre quem pode dar a ele uma nova história." action="Criar publicação" onAction={() => window.location.assign('/nova-publicacao')} />}</main></div>;
 }
 
-function ProfileScreen({ onGoToFeed, onSettings, onSaved, onMyPosts, onAdmin }) {
+function ProfileScreen({ onGoToFeed, onSettings, onOpenPost, onAdmin }) {
   const data = useAppStore((state) => state.profile);
-  const posts = useAppStore((state) => state.posts);
   const session = useAppStore((state) => state.session);
   const loadProfile = useAppStore((state) => state.loadProfile);
+  const favorites = useAppStore((state) => state.favorites);
+  const loadFavorites = useAppStore((state) => state.loadFavorites);
+  const toggleFavorite = useAppStore((state) => state.toggleFavorite);
   const user = data?.user || session || { name: 'Seu perfil', city: 'Sua cidade', avatar: '' };
   const stats = data?.stats || { donations: 0, received: 0, rating: 0, carbonSavedPercent: 0 };
   const achievements = data?.achievements || user.achievements || [];
@@ -1028,10 +1739,23 @@ function ProfileScreen({ onGoToFeed, onSettings, onSaved, onMyPosts, onAdmin }) 
   const updateAvatar = useAppStore((state) => state.updateAvatar);
   const avatarInput = useRef(null);
   const [avatarBusy, setAvatarBusy] = useState(false);
+  const [listingTab, setListingTab] = useState('mine');
+  const [favoritesLoading, setFavoritesLoading] = useState(false);
+  const listingPosts = listingTab === 'mine' ? data?.posts || [] : favorites;
 
   useEffect(() => {
     loadProfile().catch(() => {});
   }, [loadProfile]);
+
+  useEffect(() => {
+    if (listingTab !== 'saved') return undefined;
+    let active = true;
+    setFavoritesLoading(true);
+    loadFavorites()
+      .catch((error) => { if (active) alert(error.message); })
+      .finally(() => { if (active) setFavoritesLoading(false); });
+    return () => { active = false; };
+  }, [listingTab, loadFavorites]);
 
   useEffect(() => { api.communityImpact().then((result) => setCommunityImpact(result.impact)).catch(() => {}); }, []);
 
@@ -1076,15 +1800,29 @@ function ProfileScreen({ onGoToFeed, onSettings, onSaved, onMyPosts, onAdmin }) 
         {communityImpact ? <section className="community-impact-card"><span className="eyebrow">Comunidade ReUsa+</span><div><MiniImpact icon="recycling" value={communityImpact.itemsReused} label="Reaproveitados" layout="centered" /><MiniImpact icon="diversity_3" value={communityImpact.beneficiaries} label="Beneficiados" layout="centered" /><MiniImpact icon="swap_horiz" value={communityImpact.exchanges} label="Trocas" layout="centered" /></div></section> : null}
         <section className="reputation-card"><div><span className="eyebrow">Reputação</span><h2>{reputation.rating ? `⭐ ${reputation.rating.toFixed(1)}` : 'Sem avaliações'}</h2><p>{reputation.count} avaliações</p></div>{data?.reviews?.length ? <div className="review-preview">{data.reviews.slice(0, 2).map((review) => <p key={review.id}><strong>⭐ {review.rating} · {review.reviewerName}</strong>{review.comment ? ` — ${review.comment}` : ''}</p>)}</div> : null}</section>
         {achievements.length ? <section className="badge-row">{achievements.map((achievement, index) => <Badge key={achievement} tone={['mint', 'coral', 'stone'][index % 3]} icon="workspace_premium" label={achievement} />)}</section> : null}
-        <section className="profile-toolbar"><h2>Meus anúncios</h2><div><button className="profile-icon-action active" onClick={onMyPosts} aria-label="Meus anúncios" title="Meus anúncios"><span className="material-symbols-outlined">grid_view</span></button><button className="profile-icon-action" onClick={onSaved} aria-label="Itens salvos" title="Itens salvos"><span className="material-symbols-outlined">bookmark</span></button></div></section>
-        <section className="profile-grid">
-          {posts.filter((post) => post.authorId === user.id || post.author?.id === user.id).map((post) => (
-            <div key={post.id} className="mini-post">
-              <div className="mini-post-thumb"><img src={post.imageUrl} alt={post.title} /><span>{post.category}</span></div>
-              <strong>{post.title}</strong>
-              <p>Doado há 2 dias</p>
+        <section className="profile-toolbar">
+          <h2 id="profile-listing-title">{listingTab === 'mine' ? 'Meus anúncios' : 'Itens salvos'}</h2>
+          <div className="profile-listing-actions">
+            <div className="profile-listing-tabs" role="tablist" aria-label="Anúncios do perfil">
+              <button id="profile-mine-tab" className={`profile-icon-action ${listingTab === 'mine' ? 'active' : ''}`} onClick={() => setListingTab('mine')} role="tab" aria-selected={listingTab === 'mine'} aria-controls="profile-listing-panel" aria-label="Meus anúncios" title="Meus anúncios"><span className="material-symbols-outlined">grid_view</span></button>
+              <button id="profile-saved-tab" className={`profile-icon-action ${listingTab === 'saved' ? 'active' : ''}`} onClick={() => setListingTab('saved')} role="tab" aria-selected={listingTab === 'saved'} aria-controls="profile-listing-panel" aria-label="Itens salvos" title="Itens salvos"><span className="material-symbols-outlined">bookmark</span></button>
             </div>
-          ))}
+            <nav className="profile-listing-shortcuts" aria-label="Atalhos do perfil">
+              <a className="profile-icon-action" href="/alertas" aria-label="Meus alertas de itens" title="Meus alertas de itens"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4m-2-19v1"/></svg></a>
+              <a className="profile-icon-action" href="/pedidos" aria-label="Pedidos da comunidade" title="Pedidos da comunidade"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 5h16v15H4zM8 3v4m8-4v4M8 11h8m-8 4h5"/></svg></a>
+              <a className="profile-icon-action" href="/negociacoes" aria-label="Minhas negociações" title="Minhas negociações"><svg width="21" height="21" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="M4 7h16m-4-4 4 4-4 4M20 17H4m4-4-4 4 4 4"/></svg></a>
+            </nav>
+          </div>
+        </section>
+        <section className="profile-grid" id="profile-listing-panel" role="tabpanel" aria-labelledby={listingTab === 'mine' ? 'profile-mine-tab' : 'profile-saved-tab'} aria-live="polite">
+          {favoritesLoading ? <div className="profile-listing-loading"><span className="material-symbols-outlined">progress_activity</span><span>Carregando itens salvos...</span></div> : listingPosts.length ? listingPosts.map((post) => (
+            <article key={post.id} className="mini-post">
+              <div className="mini-post-thumb"><img src={post.imageUrl} alt={post.title} /><span>{post.category || 'Anúncio'}</span></div>
+              <strong>{post.title}</strong>
+              <p>{[post.location, post.status].filter(Boolean).join(' · ') || formatRelativeTime(post.createdAt)}</p>
+              <div className="profile-post-actions"><button type="button" className="profile-view-post-btn" onClick={() => onOpenPost(post.id)}><span className="material-symbols-outlined" aria-hidden="true">visibility</span>Ver anúncio</button>{listingTab === 'saved' ? <button type="button" className="text-btn" onClick={() => toggleFavorite(post.id).catch((error) => alert(error.message))}>Remover</button> : null}</div>
+            </article>
+          )) : <EmptyState icon={listingTab === 'mine' ? 'inventory_2' : 'bookmark_border'} title={listingTab === 'mine' ? 'Você ainda não publicou anúncios' : 'Nenhum item salvo'} text={listingTab === 'mine' ? 'Seus próximos anúncios aparecerão aqui.' : 'Salve anúncios para encontrá-los rapidamente aqui.'} action={listingTab === 'saved' ? 'Explorar anúncios' : undefined} onAction={onGoToFeed} />}
         </section>
       </main>
     </Shell>
@@ -1099,21 +1837,40 @@ function MapScreen({ onSuggest }) {
   const [selectedPoint, setSelectedPoint] = useState(null);
   const [userLocation, setUserLocation] = useState(null);
   const [category, setCategory] = useState('Todos');
+  const [campaignCount, setCampaignCount] = useState(0);
   const [search, setSearch] = useState('');
   const [mapCenter, setMapCenter] = useState([-2.4431, -54.7083]);
+  const [routeOrigin, setRouteOrigin] = useState([-2.4431, -54.7083]);
+  const [route, setRoute] = useState(null);
+  const [routeBusy, setRouteBusy] = useState(false);
+  const [routeError, setRouteError] = useState('');
   const [searchBusy, setSearchBusy] = useState(false);
+  const routeRequest = useRef(0);
 
-  const mapPoints = collectionPoints.map((point, index) => ({
-    ...point,
-    latitude: point.latitude || { 'point-1': -2.4431, 'point-2': -1.4558 }[point.id] || [-2.4431, -1.4558, -3.119, -2.53][index] || -2.4431,
-    longitude: point.longitude || { 'point-1': -54.7083, 'point-2': -48.4902 }[point.id] || [-54.7083, -48.4902, -60.0217, -44.3][index] || -54.7083
-  }));
+  const mapPoints = collectionPoints.map((point, index) => {
+    const latitude = finiteCoordinate(point.latitude);
+    const longitude = finiteCoordinate(point.longitude);
+    const hasCoordinates = latitude !== null && longitude !== null
+      && latitude >= -90 && latitude <= 90
+      && longitude >= -180 && longitude <= 180;
+    return {
+      ...point,
+      latitude: hasCoordinates ? latitude : ({ 'point-1': -2.4431, 'point-2': -1.4558 }[point.id] || [-2.4431, -1.4558, -3.119, -2.53][index] || -2.4431),
+      longitude: hasCoordinates ? longitude : ({ 'point-1': -54.7083, 'point-2': -48.4902 }[point.id] || [-54.7083, -48.4902, -60.0217, -44.3][index] || -54.7083),
+      routeCoordinates: hasCoordinates ? [latitude, longitude] : null
+    };
+  });
   const visiblePoints = mapPoints.filter((point) => category === 'Todos' || point.categories?.some((item) => item.toLowerCase().includes(category.toLowerCase())));
+  const currentSelectedPoint = selectedPoint ? mapPoints.find((point) => point.id === selectedPoint.id) || selectedPoint : null;
+  const canRouteToSelectedPoint = Boolean(currentSelectedPoint?.routeCoordinates);
 
   useEffect(() => {
     if (session?.city) {
       loadCollectionPointsNearby(session.city).then((result) => {
-        if (result.center) setMapCenter(result.center);
+        if (result.center) {
+          setMapCenter(result.center);
+          updateRouteOrigin(result.center);
+        }
       }).catch(() => {});
       return;
     }
@@ -1125,6 +1882,72 @@ function MapScreen({ onSuggest }) {
     if (selectedPoint && !visiblePoints.some((point) => point.id === selectedPoint.id)) setSelectedPoint(visiblePoints[0] || null);
   }, [collectionPoints, category]);
 
+  useEffect(() => {
+    clearRoute();
+  }, [selectedPoint?.id]);
+
+  function updateRouteOrigin(nextOrigin, clearExistingRoute = false) {
+    if (!Array.isArray(nextOrigin)) return;
+    const latitude = finiteCoordinate(nextOrigin[0]);
+    const longitude = finiteCoordinate(nextOrigin[1]);
+    if (latitude === null || longitude === null || latitude < -90 || latitude > 90 || longitude < -180 || longitude > 180) return;
+    setRouteOrigin((current) => (
+      Math.abs(current[0] - latitude) < 0.000001 && Math.abs(current[1] - longitude) < 0.000001
+        ? current
+        : [latitude, longitude]
+    ));
+    if (clearExistingRoute && (Math.abs(routeOrigin[0] - latitude) >= 0.000001 || Math.abs(routeOrigin[1] - longitude) >= 0.000001)) clearRoute();
+  }
+
+  function clearRoute() {
+    routeRequest.current += 1;
+    setRoute(null);
+    setRouteBusy(false);
+    setRouteError('');
+  }
+
+  async function showRoute() {
+    const destination = currentSelectedPoint;
+    if (!destination?.routeCoordinates) {
+      setRouteError('Este ponto ainda não tem coordenadas verificadas para traçar uma rota.');
+      return;
+    }
+
+    const [fromLat, fromLng] = routeOrigin;
+    const [toLat, toLng] = destination.routeCoordinates;
+    const requestId = ++routeRequest.current;
+    setRouteBusy(true);
+    setRouteError('');
+
+    try {
+      const result = await api.mapRoute({ fromLat, fromLng, toLat, toLng });
+      const routeData = result.route || result;
+      const positions = (routeData.geometry?.coordinates || [])
+        .map((coordinates) => {
+          const [longitude, latitude] = Array.isArray(coordinates) ? coordinates : [];
+          return [Number(latitude), Number(longitude)];
+        })
+        .filter(([latitude, longitude]) => Number.isFinite(latitude) && Number.isFinite(longitude));
+
+      if (positions.length < 2) throw new Error('Não foi possível encontrar uma rota para este ponto.');
+      if (requestId !== routeRequest.current) return;
+
+      setRoute({
+        positions,
+        origin: [fromLat, fromLng],
+        distance: routeData.distance,
+        duration: routeData.duration
+      });
+    } catch (error) {
+      if (requestId === routeRequest.current) {
+        setRoute(null);
+        setRouteError(error.message || 'Não foi possível traçar a rota agora.');
+      }
+    } finally {
+      if (requestId === routeRequest.current) setRouteBusy(false);
+    }
+  }
+
   async function searchPlace(event) {
     event.preventDefault();
     if (!search.trim()) return;
@@ -1133,7 +1956,9 @@ function MapScreen({ onSuggest }) {
       const response = await fetch(`https://nominatim.openstreetmap.org/search?format=jsonv2&limit=1&countrycodes=br&q=${encodeURIComponent(search)}`, { headers: { Accept: 'application/json' } });
       const places = await response.json();
       if (!places.length) throw new Error('Local não encontrado');
-      setMapCenter([Number(places[0].lat), Number(places[0].lon)]);
+      const center = [Number(places[0].lat), Number(places[0].lon)];
+      setMapCenter(center);
+      updateRouteOrigin(center, true);
     } catch (error) {
       alert(error.message);
     } finally {
@@ -1147,7 +1972,11 @@ function MapScreen({ onSuggest }) {
       return;
     }
     navigator.geolocation.getCurrentPosition(
-      (position) => setUserLocation([position.coords.latitude, position.coords.longitude]),
+      (position) => {
+        const location = [position.coords.latitude, position.coords.longitude];
+        setUserLocation(location);
+        updateRouteOrigin(location, true);
+      },
       () => alert('Não foi possível acessar sua localização.')
     );
   }
@@ -1159,51 +1988,180 @@ function MapScreen({ onSuggest }) {
         <MapContainer center={mapCenter} zoom={12} scrollWheelZoom className="live-map">
           <TileLayer attribution='&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors' url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png" />
           <MapViewport position={mapCenter} />
-          {visiblePoints.map((point) => <CircleMarker key={point.id} center={[point.latitude, point.longitude]} pathOptions={{ color: '#006d3d', fillColor: '#00d67d', fillOpacity: 0.9 }} radius={10} eventHandlers={{ click: () => setSelectedPoint(point) }} />)}
+          <MapCenterTracker onChange={(origin) => updateRouteOrigin(origin, true)} />
+          {route ? <>
+            <Polyline positions={route.positions} pathOptions={{ color: '#ffffff', weight: 8, opacity: 0.9, lineCap: 'round', lineJoin: 'round', interactive: false }} />
+            <Polyline positions={route.positions} pathOptions={{ color: '#078b52', weight: 5, opacity: 0.96, lineCap: 'round', lineJoin: 'round', interactive: false }} />
+            <CircleMarker center={route.origin} pathOptions={{ color: '#ffffff', fillColor: '#176f9c', fillOpacity: 1, weight: 2, interactive: false }} radius={6} />
+            <RouteViewport positions={route.positions} />
+          </> : null}
+          {visiblePoints.map((point) => <Marker key={point.id} position={[point.latitude, point.longitude]} icon={collectionPointMarkerIcon(selectedPoint?.id === point.id)} title={point.name} alt={point.name} keyboard eventHandlers={{ click: () => setSelectedPoint(point) }}><Tooltip className="collection-point-tooltip" direction="top" offset={[0, -14]} opacity={1}>{point.name || 'Ponto de coleta'}</Tooltip></Marker>)}
           {userLocation ? <><CircleMarker center={userLocation} pathOptions={{ color: '#2459d6', fillColor: '#77a0ff', fillOpacity: 0.9 }} radius={8} /><RecenterMap position={userLocation} /></> : null}
         </MapContainer>
-        <form className="map-search" onSubmit={searchPlace}><span className="material-symbols-outlined">search</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar cidade ou endereço" /><button disabled={searchBusy} aria-label="Buscar local"><span className="material-symbols-outlined">arrow_forward</span></button></form>
+        <form className="map-search" onSubmit={searchPlace}><span className="material-symbols-outlined">search</span><input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Buscar cidade ou endereço" aria-label="Buscar cidade ou endereço" /><button disabled={searchBusy} aria-label="Buscar local"><span className="material-symbols-outlined">arrow_forward</span></button></form>
         <div className="map-chips">
           {['Todos', 'Eletrônicos', 'Pilhas', 'Óleo', 'Cooperativas'].map((item) => <button key={item} className={category === item ? 'pill pill-active' : 'pill'} onClick={() => setCategory(item)}>{item}</button>)}
         </div>
-        <button className="map-locate" onClick={locate} title="Usar minha localização"><span className="material-symbols-outlined">my_location</span></button>
-        {selectedPoint ? <div className="map-card">
+        <button className="map-locate" onClick={locate} title="Usar minha localização (opcional)" aria-label="Usar minha localização (opcional)"><span className="material-symbols-outlined">my_location</span></button>
+        {currentSelectedPoint ? <div className="map-card">
           <div className="map-card-head">
             <div>
               <span>Centro de coleta</span>
-              <h2>{selectedPoint?.name || 'EcoCentro Santarém'}</h2>
+              <h2>{currentSelectedPoint.name || 'EcoCentro Santarém'}</h2>
             </div>
             <button className="icon-btn" onClick={() => setSelectedPoint(null)} aria-label="Fechar informações"><span className="material-symbols-outlined">close</span></button>
           </div>
           <div className="map-card-body">
-            <div><span className="material-symbols-outlined">recycling</span><span>{(selectedPoint?.categories || ['Eletrônicos', 'plástico', 'metal']).join(', ')}</span></div>
-            <div><span className="material-symbols-outlined">schedule</span><span>{selectedPoint?.hours || '08:00 – 17:00'}</span></div>
-            <div><span className="material-symbols-outlined">location_on</span><span>{selectedPoint?.location || 'Localização não informada'}</span></div>
-            <div><span className="material-symbols-outlined">verified</span><span>{selectedPoint?.origin || selectedPoint?.source || 'Origem não informada'}{selectedPoint?.lastUpdated ? ` · atualizado em ${new Date(selectedPoint.lastUpdated).toLocaleDateString('pt-BR')}` : ''}</span></div>
+            <div><span className="material-symbols-outlined">recycling</span><span>{(currentSelectedPoint.categories || ['Eletrônicos', 'plástico', 'metal']).join(', ')}</span></div>
+            <div><span className="material-symbols-outlined">schedule</span><span>{currentSelectedPoint.hours || '08:00 – 17:00'}</span></div>
+            <div><span className="material-symbols-outlined">location_on</span><span>{currentSelectedPoint.location || 'Localização não informada'}</span></div>
+            <div><span className="material-symbols-outlined">verified</span><span>{currentSelectedPoint.origin || currentSelectedPoint.source || 'Origem não informada'}{currentSelectedPoint.lastUpdated ? ` · atualizado em ${new Date(currentSelectedPoint.lastUpdated).toLocaleDateString('pt-BR')}` : ''}</span></div>
           </div>
-          <div className="map-actions">
-            <button className="ghost-btn" onClick={() => selectedPoint && alert(`${selectedPoint.name}\n${selectedPoint.location}`)}>Ver detalhes</button>
-            <a className="primary-btn" href={selectedPoint ? `https://www.openstreetmap.org/directions?to=${selectedPoint.latitude}%2C${selectedPoint.longitude}` : '#'} target="_blank" rel="noreferrer">Como chegar <span className="material-symbols-outlined">navigation</span></a>
-          </div>
+          {route ? <div className="map-route-summary" role="status">
+            <span className="material-symbols-outlined" aria-hidden="true">route</span>
+            <div><strong>Rota exibida no mapa</strong><small>{formatRouteDistance(route.distance)} · cerca de {formatRouteDuration(route.duration)}. A partida está marcada em azul.</small></div>
+            <button type="button" onClick={clearRoute} aria-label="Limpar rota" title="Limpar rota"><span className="material-symbols-outlined">close</span></button>
+          </div> : null}
+          {routeError ? <div className="map-route-error" role="alert"><span className="material-symbols-outlined" aria-hidden="true">error_outline</span><span>{routeError}</span><button type="button" onClick={showRoute}>Tentar novamente</button></div> : null}
+          {!canRouteToSelectedPoint ? <p className="map-route-hint">A rota estará disponível quando este ponto tiver coordenadas verificadas.</p> : !route ? <p className="map-route-hint">A saída será o centro atual do mapa; sua localização não será solicitada.</p> : null}
+          <button className="primary-btn full map-route-btn" type="button" onClick={showRoute} disabled={routeBusy || !canRouteToSelectedPoint} title={canRouteToSelectedPoint ? 'Exibir rota neste mapa' : 'Este ponto ainda não tem coordenadas verificadas'}>{routeBusy ? 'Traçando rota...' : route ? 'Atualizar rota' : 'Como chegar'} <span className="material-symbols-outlined">navigation</span></button>
         </div> : <div className="map-floating-actions"><button className="map-reopen" onClick={() => setSelectedPoint(visiblePoints[0] || null)}><span className="material-symbols-outlined">info</span>Mostrar ponto selecionado</button><button className="map-suggest" onClick={onSuggest}><span className="material-symbols-outlined">add_location_alt</span>Sugerir ponto</button></div>}
       </main>
     </Shell>
   );
 }
 
-function SuggestCollectionPointScreen({ onBack }) {
-  const [form, setForm] = useState({ name: '', street: '', number: '', neighborhood: '', city: '', state: '', postalCode: '', hours: '', categories: '' });
+const emptyCollectionPointForm = () => ({ name: '', postalCode: '', street: '', number: '', neighborhood: '', city: '', state: '', location: '', hours: '', categories: '' });
+
+function collectionPointFormFromPoint(point) {
+  const form = emptyCollectionPointForm();
+  if (!point) return form;
+
+  form.name = String(point.name || '');
+  form.location = String(point.location || '').trim();
+  form.hours = String(point.hours || '');
+  form.categories = Array.isArray(point.categories) ? point.categories.join(', ') : String(point.categories || '');
+
+  const originalParts = form.location.split(',').map((part) => part.trim()).filter(Boolean);
+  const postalCode = originalParts.find((part) => /^\d{5}-?\d{3}$/.test(part));
+  if (postalCode) form.postalCode = postalCode.replace(/\D/g, '');
+  const parts = originalParts.filter((part) => !/^brasil$/i.test(part) && part !== postalCode);
+  let cityStateIndex = -1;
+  for (let index = parts.length - 1; index >= 0; index -= 1) {
+    if (/\s-\s/.test(parts[index])) {
+      cityStateIndex = index;
+      break;
+    }
+  }
+
+  if (cityStateIndex >= 0) {
+    const [city, ...state] = parts[cityStateIndex].split(/\s-\s/);
+    form.city = city || '';
+    form.state = state.join(' - ');
+    const addressParts = parts.slice(0, cityStateIndex);
+    if (addressParts.length) {
+      form.neighborhood = addressParts.at(-1) || '';
+      const streetParts = addressParts.slice(0, -1);
+      const candidateNumber = streetParts.at(-1) || '';
+      if (/^(?:\d+[\w/-]*|s\/n)$/i.test(candidateNumber)) form.number = streetParts.pop() || '';
+      form.street = streetParts.join(', ');
+    }
+  } else if (parts.length >= 2) {
+    form.city = parts.at(-2) || '';
+    form.state = parts.at(-1) || '';
+  } else {
+    form.city = parts[0] || '';
+  }
+
+  return form;
+}
+
+function CollectionPointFormFields({ form, setForm, cepBusy, setCepBusy, editing = false }) {
+  const cepRequest = useRef(0);
+  const addressPreview = [form.street, form.neighborhood, [form.city, form.state].filter(Boolean).join(' - ')].filter(Boolean).join(' · ');
+
+  async function lookupCep(value) {
+    const postalCode = value.replace(/\D/g, '').slice(0, 8);
+    const requestId = ++cepRequest.current;
+    if (postalCode.length !== 8) {
+      setForm((current) => ({ ...current, postalCode }));
+      setCepBusy(false);
+      return;
+    }
+
+    setForm((current) => ({ ...current, postalCode, street: '', neighborhood: '', city: '', state: '' }));
+    setCepBusy(true);
+    try {
+      const response = await fetch(`https://viacep.com.br/ws/${postalCode}/json/`);
+      if (!response.ok) throw new Error('Não foi possível consultar este CEP.');
+      const address = await response.json();
+      if (address.erro) throw new Error('CEP não encontrado.');
+      if (requestId !== cepRequest.current) return;
+      setForm((current) => ({
+        ...current,
+        postalCode,
+        street: address.logradouro || current.street,
+        neighborhood: address.bairro || current.neighborhood,
+        city: address.localidade || current.city,
+        state: address.uf || current.state
+      }));
+    } catch (error) {
+      if (requestId === cepRequest.current) alert(error.message || 'Não foi possível consultar este CEP.');
+    } finally {
+      if (requestId === cepRequest.current) setCepBusy(false);
+    }
+  }
+
+  return <>
+    <Field label="Nome do local" icon="location_city" value={form.name} onChange={(value) => setForm((current) => ({ ...current, name: value }))} placeholder="Ex: Cooperativa do bairro" />
+    {editing ? <><div className="point-location-help"><span className="material-symbols-outlined">info</span><span>Confira a localização atual ou use o CEP e os campos abaixo para atualizá-la.</span></div><Field label="Localização pública atual" icon="location_on" value={form.location} onChange={(value) => setForm((current) => ({ ...current, location: value, postalCode: '', street: '', number: '', neighborhood: '', city: '', state: '' }))} placeholder="Ex: Centro, Santarém - PA" /></> : null}
+    <Field label={cepBusy ? 'Consultando CEP...' : 'CEP (opcional)'} icon="markunread_mailbox" value={form.postalCode} onChange={lookupCep} placeholder="00000-000" />
+    {cepBusy || addressPreview ? <div className="address-preview" role="status"><span className="material-symbols-outlined">{cepBusy ? 'progress_activity' : 'location_on'}</span><span>{cepBusy ? 'Preenchendo o endereço...' : addressPreview}</span></div> : null}
+    <div className="point-address-grid">
+      <Field label="Rua" icon="signpost" value={form.street} onChange={(value) => setForm((current) => ({ ...current, street: value }))} placeholder="Ex: Rua dos Tapajós" />
+      <Field label="Número" icon="pin" value={form.number} onChange={(value) => setForm((current) => ({ ...current, number: value }))} placeholder="Ex: 150" />
+      <Field label="Bairro" icon="location_city" value={form.neighborhood} onChange={(value) => setForm((current) => ({ ...current, neighborhood: value }))} placeholder="Ex: Centro" />
+      <Field label="Cidade" icon="location_on" value={form.city} onChange={(value) => setForm((current) => ({ ...current, city: value }))} placeholder="Ex: Santarém" />
+      <Field label="Estado" icon="map" value={form.state} onChange={(value) => setForm((current) => ({ ...current, state: value }))} placeholder="Ex: PA" />
+    </div>
+    <Field label="Materiais aceitos" icon="recycling" value={form.categories} onChange={(value) => setForm((current) => ({ ...current, categories: value }))} placeholder="Ex: papel, plástico, eletrônicos" />
+    <Field label="Horário (opcional)" icon="schedule" value={form.hours} onChange={(value) => setForm((current) => ({ ...current, hours: value }))} placeholder="Ex: segunda a sexta, 8h às 17h" />
+  </>;
+}
+
+function CollectionPointFormScreen({ onBack, admin = false, onSuccess, point = null }) {
+  const editing = admin && Boolean(point);
+  const [form, setForm] = useState(() => editing ? collectionPointFormFromPoint(point) : emptyCollectionPointForm());
   const [busy, setBusy] = useState(false);
+  const [cepBusy, setCepBusy] = useState(false);
+  const heading = editing ? 'Editar ponto de coleta' : admin ? 'Cadastrar ponto de coleta' : 'Conhece um ponto de coleta?';
+  const description = editing ? 'Atualize as informações do local. O CEP preenche os dados de endereço automaticamente.' : admin ? 'Cadastre um local verificado. Informe o CEP para preencher o endereço automaticamente.' : 'Informe um endereço público. Buscamos as coordenadas automaticamente e a equipe verifica antes de publicar.';
+  const actionLabel = editing ? 'Salvar alterações' : admin ? 'Cadastrar ponto' : 'Enviar sugestão';
+
+  useEffect(() => {
+    setForm(editing ? collectionPointFormFromPoint(point) : emptyCollectionPointForm());
+    setCepBusy(false);
+  }, [editing, point?.id]);
+
   async function submit(event) {
     event.preventDefault();
     setBusy(true);
     try {
-      await api.suggestCollectionPoint({ ...form, categories: form.categories.split(',').map((item) => item.trim()).filter(Boolean) });
-      alert('Sugestão enviada. Ela ficará disponível após aprovação da equipe.');
-      onBack();
+      const payload = { ...form, categories: form.categories.split(',').map((item) => item.trim()).filter(Boolean) };
+      if (editing) await api.updateAdminCollectionPoint(point.id, payload);
+      else if (admin) await api.createAdminCollectionPoint(payload);
+      else await api.suggestCollectionPoint(payload);
+      alert(editing ? 'Ponto de coleta atualizado.' : admin ? 'Ponto de coleta cadastrado e disponível no mapa.' : 'Sugestão enviada. Ela ficará disponível após aprovação da equipe.');
+      if (onSuccess) await onSuccess();
+      else onBack();
     } catch (error) { alert(error.message); } finally { setBusy(false); }
   }
-  return <div className="subpage"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Sugerir ponto</h1><span /></header><main className="page suggestion-page"><section className="composer-card"><span className="eyebrow">Mapa colaborativo</span><h2>Conhece um ponto de coleta?</h2><p>Informe um endereço público. Buscamos as coordenadas automaticamente e a equipe verifica antes de publicar.</p><form className="composer-form" onSubmit={submit}><Field label="Nome do local" icon="location_city" value={form.name} onChange={(value) => setForm((current) => ({ ...current, name: value }))} placeholder="Ex: Cooperativa do bairro" /><div className="point-address-grid"><Field label="Rua" icon="signpost" value={form.street} onChange={(value) => setForm((current) => ({ ...current, street: value }))} placeholder="Ex: Rua dos Tapajós" /><Field label="Número" icon="pin" value={form.number} onChange={(value) => setForm((current) => ({ ...current, number: value }))} placeholder="Ex: 150" /><Field label="Bairro" icon="location_city" value={form.neighborhood} onChange={(value) => setForm((current) => ({ ...current, neighborhood: value }))} placeholder="Ex: Centro" /><Field label="Cidade" icon="location_on" value={form.city} onChange={(value) => setForm((current) => ({ ...current, city: value }))} placeholder="Ex: Santarém" /><Field label="Estado" icon="map" value={form.state} onChange={(value) => setForm((current) => ({ ...current, state: value }))} placeholder="Ex: PA" /><Field label="CEP (opcional)" icon="markunread_mailbox" value={form.postalCode} onChange={(value) => setForm((current) => ({ ...current, postalCode: value }))} placeholder="00000-000" /></div><Field label="Materiais aceitos" icon="recycling" value={form.categories} onChange={(value) => setForm((current) => ({ ...current, categories: value }))} placeholder="Ex: papel, plástico, eletrônicos" /><Field label="Horário (opcional)" icon="schedule" value={form.hours} onChange={(value) => setForm((current) => ({ ...current, hours: value }))} placeholder="Ex: segunda a sexta, 8h às 17h" /><button className="primary-btn full" disabled={busy}>{busy ? 'Buscando localização...' : 'Enviar sugestão'}<span className="material-symbols-outlined">send</span></button></form></section></main></div>;
+
+  return <div className={admin ? 'admin-screen' : 'subpage'}><UnifiedTopbar onBack={onBack} /><main className="page suggestion-page"><section className={`composer-card collection-point-form-card${editing ? ' is-editing' : ''}`}><span className="eyebrow">{admin ? 'Administração' : 'Mapa colaborativo'}</span><h2>{heading}</h2><p>{description}</p>{editing ? <div className="point-editor-status"><span className="material-symbols-outlined">edit_location_alt</span><span><strong>{point.name}</strong><small>Revise os dados e salve quando terminar.</small></span></div> : null}<form className="composer-form" onSubmit={submit}><CollectionPointFormFields form={form} setForm={setForm} cepBusy={cepBusy} setCepBusy={setCepBusy} editing={editing} /><div className={`collection-point-form-actions${editing ? ' is-editing' : ''}`}>{editing ? <button className="ghost-btn" type="button" onClick={onBack} disabled={busy || cepBusy}><span className="material-symbols-outlined">close</span>Cancelar</button> : null}<button className={`primary-btn${editing ? '' : ' full'}`} type="submit" disabled={busy || cepBusy}>{busy ? (editing ? 'Salvando alterações...' : admin ? 'Cadastrando ponto...' : 'Enviando sugestão...') : cepBusy ? 'Consultando CEP...' : actionLabel}<span className="material-symbols-outlined">{editing ? 'save' : 'send'}</span></button></div></form></section></main></div>;
+}
+
+function SuggestCollectionPointScreen({ onBack }) {
+  return <CollectionPointFormScreen onBack={onBack} />;
 }
 
 function RecenterMap({ position }) {
@@ -1222,14 +2180,86 @@ function MapViewport({ position }) {
   return null;
 }
 
+function MapCenterTracker({ onChange }) {
+  useMapEvents({
+    dragend(event) {
+      const center = event.target.getCenter();
+      onChange([center.lat, center.lng]);
+    }
+  });
+  return null;
+}
+
+function RouteViewport({ positions }) {
+  const map = useMap();
+  useEffect(() => {
+    if (!positions?.length) return;
+    map.fitBounds(positions, {
+      paddingTopLeft: [28, 112],
+      paddingBottomRight: [28, 285],
+      maxZoom: 14
+    });
+  }, [map, positions]);
+  return null;
+}
+
 function SettingsScreen({ onBack, onLogout }) {
   const profile = useAppStore((state) => state.profile);
   const updateProfile = useAppStore((state) => state.updateProfile);
   const logout = useAppStore((state) => state.logout);
-  const [activeSection, setActiveSection] = useState('perfil');
+  const [activeSection, setActiveSection] = useState(() => new URLSearchParams(window.location.search).has('stripe_onboarding') ? 'pagamentos' : 'perfil');
+  const [paymentItems, setPaymentItems] = useState([]);
+  const [stripeStatus, setStripeStatus] = useState(null);
+  const [stripeBusy, setStripeBusy] = useState(false);
+  const [stripeError, setStripeError] = useState('');
+  const [stripeActionError, setStripeActionError] = useState('');
+  const stripeMounted = useRef(true);
+  const stripeRequest = useRef(null);
+  const paymentDemoMode = Boolean(stripeStatus?.demoMode ?? profile?.user?.stripeDemoMode);
+  const paymentTestMode = Boolean(stripeStatus?.testMode ?? profile?.user?.stripeTestMode);
+  const stripeAccessDenied = stripeStatus?.disabledReason === 'account_access_denied';
   const [form, setForm] = useState({ name: profile?.user?.name || '', city: profile?.user?.city || '', neighborhood: profile?.user?.neighborhood || '', cep: profile?.user?.cep || '', address: profile?.user?.address || '', businessName: profile?.user?.businessName || '' });
   const [passwordForm, setPasswordForm] = useState({ currentPassword: '', newPassword: '' });
   const [preferences, setPreferences] = useState(profile?.user?.notificationPreferences || ['Curtidas', 'Comentários', 'Interesse', 'Mensagens', 'Negociações', 'Avaliações', 'Sistema']);
+
+  useEffect(() => {
+    api.paymentItems().then((result) => setPaymentItems(result.items || [])).catch(() => {});
+  }, []);
+  useEffect(() => {
+    stripeMounted.current = true;
+    return () => { stripeMounted.current = false; };
+  }, []);
+
+  const syncStripeStatus = useCallback(() => {
+    if (!stripeRequest.current) {
+      stripeRequest.current = api.stripeStatus().then((status) => {
+        if (stripeMounted.current) { setStripeStatus(status); setStripeError(''); }
+        return status;
+      }).catch((error) => {
+        if (stripeMounted.current) setStripeError(error.message);
+        throw error;
+      }).finally(() => { stripeRequest.current = null; });
+    }
+    return stripeRequest.current;
+  }, []);
+
+  useEffect(() => {
+    if (activeSection !== 'pagamentos' || stripeAccessDenied) return;
+    const refresh = () => {
+      if (document.visibilityState !== 'hidden') syncStripeStatus().catch(() => {});
+    };
+    refresh();
+    const interval = window.setInterval(refresh, 15000);
+    window.addEventListener('focus', refresh);
+    window.addEventListener('pageshow', refresh);
+    document.addEventListener('visibilitychange', refresh);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener('focus', refresh);
+      window.removeEventListener('pageshow', refresh);
+      document.removeEventListener('visibilitychange', refresh);
+    };
+  }, [activeSection, syncStripeStatus, stripeAccessDenied]);
 
   useEffect(() => {
     if (profile?.user) setForm({ name: profile.user.name || '', city: profile.user.city || '', neighborhood: profile.user.neighborhood || '', cep: profile.user.cep || '', address: profile.user.address || '', businessName: profile.user.businessName || '' });
@@ -1255,6 +2285,42 @@ function SettingsScreen({ onBack, onLogout }) {
     try { await api.updatePreferences(preferences); alert('Preferências de notificações atualizadas.'); } catch (error) { alert(error.message); }
   }
 
+  async function connectStripe() {
+    setStripeBusy(true); setStripeError(''); setStripeActionError('');
+    try {
+      const status = await syncStripeStatus();
+      if (!stripeConnectionState(status).canResume) return;
+      const { authorizationUrl } = await api.stripeConnect();
+      window.location.assign(authorizationUrl);
+    } catch (error) {
+      setStripeActionError(error.message);
+    } finally { setStripeBusy(false); }
+  }
+
+  async function openStripeDashboard() {
+    setStripeBusy(true); setStripeError(''); setStripeActionError('');
+    try { window.location.assign((await api.stripeDashboard()).url); } catch(error) { setStripeActionError(error.message); } finally { setStripeBusy(false); }
+  }
+
+  async function reconnectStripeTest() {
+    if (!stripeStatus?.canRestartTestConnection) return;
+    setStripeBusy(true); setStripeError(''); setStripeActionError('');
+    try {
+      const { authorizationUrl } = await api.stripeReconnectTest(stripeStatus.accountId);
+      window.location.assign(authorizationUrl);
+    } catch (error) {
+      // A link response can fail after the replacement was saved. Show that new
+      // binding so the seller can resume it instead of requesting another account.
+      await syncStripeStatus().catch(() => {});
+      setStripeActionError(error.message);
+    } finally { setStripeBusy(false); }
+  }
+
+  async function refreshStripeStatus() {
+    setStripeBusy(true); setStripeError(''); setStripeActionError('');
+    try { await syncStripeStatus(); } catch(error) { setStripeError(error.message); } finally { setStripeBusy(false); }
+  }
+
   async function removeAccount() {
     const confirmation = window.prompt('Digite EXCLUIR para confirmar a exclusão da conta.');
     if (confirmation !== 'EXCLUIR') return;
@@ -1267,19 +2333,16 @@ function SettingsScreen({ onBack, onLogout }) {
     <Shell nav={navRoutes} active="/configuracoes">
       <UnifiedTopbar onBack={onBack} />
       <main className="page settings-page">
-        <header className="settings-heading">
-          <button className="back-link settings-back" onClick={onBack} aria-label="Voltar ao perfil"><span className="material-symbols-outlined">arrow_back</span></button>
-          <h1>Configurações</h1>
-        </header>
         <div className="settings-layout">
           <aside className="settings-menu" aria-label="Seções de configurações">
             <button className={`settings-menu-item ${activeSection === 'perfil' ? 'active' : ''}`} onClick={() => setActiveSection('perfil')}><span className="material-symbols-outlined">person</span><span><strong>Meu perfil</strong></span></button>
             <button className={`settings-menu-item ${activeSection === 'seguranca' ? 'active' : ''}`} onClick={() => setActiveSection('seguranca')}><span className="material-symbols-outlined">shield</span><span><strong>Segurança</strong></span></button>
             <button className={`settings-menu-item ${activeSection === 'notificacoes' ? 'active' : ''}`} onClick={() => setActiveSection('notificacoes')}><span className="material-symbols-outlined">notifications</span><span><strong>Notificações</strong></span></button>
+            <button className={`settings-menu-item ${activeSection === 'pagamentos' ? 'active' : ''}`} onClick={() => setActiveSection('pagamentos')}><span className="material-symbols-outlined">payments</span><span><strong>Compromissos</strong></span></button>
           </aside>
           <div className="settings-content">
             {activeSection === 'perfil' ? <section className="settings-profile-banner">
-              <div className="settings-avatar"><span className="material-symbols-outlined">person</span></div>
+              <div className="settings-avatar">{profile?.user?.avatar ? <img src={profile.user.avatar} alt={profile.user.name || 'Foto de perfil'} /> : <span className="material-symbols-outlined">person</span>}</div>
               <div><span className="settings-kicker">Perfil ReUsa+</span><h2>{profile?.user?.name || 'Seu perfil'}</h2><p>{profile?.user?.email || 'Atualize seus dados para manter sua comunidade por perto.'}</p></div>
               <span className="settings-status"><span className="material-symbols-outlined">verified</span>Conta ativa</span>
             </section> : null}
@@ -1296,6 +2359,10 @@ function SettingsScreen({ onBack, onLogout }) {
                 </div>
                 <div className="settings-form-footer"><small><span className="material-symbols-outlined">lock</span>Seu endereço completo nunca é exibido publicamente.</small><button className="secondary-btn">Salvar alterações</button></div>
               </form>
+              <section className="settings-actions" aria-label="Ações da conta">
+                <button className="danger-btn" onClick={signOut}><span className="material-symbols-outlined">exit_to_app</span>Sair da conta</button>
+                <button className="danger-btn" onClick={removeAccount}><span className="material-symbols-outlined">person_remove</span>Excluir minha conta</button>
+              </section>
             </section> : null}
             {activeSection === 'seguranca' ? <section className="card settings-card settings-panel" id="seguranca">
               <div className="settings-panel-heading"><div><span className="settings-panel-icon security"><span className="material-symbols-outlined">shield</span></span><div><h2>Segurança e privacidade</h2></div></div></div>
@@ -1307,7 +2374,24 @@ function SettingsScreen({ onBack, onLogout }) {
               <div className="preference-list">{['Curtidas', 'Comentários', 'Interesse', 'Mensagens', 'Negociações', 'Avaliações', 'Sistema'].map((item) => <label className="preference-row" key={item}><span><strong>{item}</strong><small>Atualizações sobre {item.toLowerCase()}</small></span><input type="checkbox" checked={preferences.includes(item)} onChange={() => setPreferences((current) => current.includes(item) ? current.filter((value) => value !== item) : [...current, item])} /><i /></label>)}</div>
               <div className="settings-form-footer"><span /><button className="secondary-btn" onClick={savePreferences}>Salvar preferências</button></div>
             </section> : null}
-            <section className="settings-actions"><button className="danger-btn" onClick={signOut}><span className="material-symbols-outlined">logout</span>Sair da conta</button><button className="danger-btn" onClick={removeAccount}><span className="material-symbols-outlined">delete_forever</span>Excluir minha conta</button></section>
+            {activeSection === 'pagamentos' ? <section className="card settings-card settings-panel" id="pagamentos">
+              <StripeConnectionCard status={stripeStatus} testMode={paymentTestMode} demoMode={paymentDemoMode} error={stripeActionError || stripeError} busy={stripeBusy} onConnect={connectStripe} onReconnectTest={reconnectStripeTest} onDashboard={openStripeDashboard} onRefresh={refreshStripeStatus} />
+              <div className="payment-items-list">{paymentItems.length ? paymentItems.map((item) => {
+                const isReserved = item.negotiationStatus === 'reserved';
+                const methodLabel = item.method === 'pix' ? 'PIX' : item.method === 'card' ? 'Cartão' : 'Boleto';
+                return <article className={`payment-item ${isReserved ? 'is-reserved' : ''}`} key={item.negotiationId}>
+                  <div className="payment-item-main">
+                    <span className="payment-item-icon material-symbols-outlined">{isReserved ? 'handshake' : 'shopping_bag'}</span>
+                    <div className="payment-item-info">
+                      <div className="payment-item-heading"><strong>{item.title}</strong><span className="payment-item-status">{isReserved ? 'Reserva confirmada' : 'Aguardando resposta'}</span></div>
+                      <div className="payment-item-meta"><span className="payment-item-amount">R$ {((item.amountCents || 0) / 100).toFixed(2).replace('.', ',')}</span><span>{methodLabel}</span></div>
+                      <small>{isReserved ? 'Combine a entrega com a outra pessoa antes de realizar o pagamento.' : 'Sua oferta foi enviada e está aguardando uma decisão.'}</small>
+                    </div>
+                  </div>
+                  <button className="payment-item-action" onClick={() => window.location.assign(`/anuncios/${item.postId}`)}><span className="material-symbols-outlined">{isReserved ? 'payments' : 'open_in_new'}</span><span>{isReserved ? 'Entrega e pagamento' : 'Acompanhar oferta'}</span><span className="material-symbols-outlined payment-item-action-arrow">arrow_forward</span></button>
+                </article>;
+              }) : <EmptyState icon="payments" title="Nenhum pagamento pendente" text="Quando você enviar uma oferta, ela aparecerá aqui para acompanhamento." />}</div>
+            </section> : null}
           </div>
         </div>
       </main>
@@ -1324,6 +2408,9 @@ function AdminScreen({ onBack }) {
   const [reports, setReports] = useState([]);
   const [points, setPoints] = useState({ points: [], suggestions: [] });
   const [busy, setBusy] = useState(true);
+  const [pointEditor, setPointEditor] = useState(null);
+  const [deletingPostId, setDeletingPostId] = useState(null);
+  const [deletingUserId, setDeletingUserId] = useState(null);
 
   const load = async () => {
     setBusy(true);
@@ -1335,57 +2422,49 @@ function AdminScreen({ onBack }) {
   useEffect(() => { if (session?.role === 'admin') load(); else setBusy(false); }, [session?.role]);
   if (session?.role !== 'admin') return <div className="access-denied"><span className="material-symbols-outlined">admin_panel_settings</span><h1>Acesso restrito</h1><p>Esta área é exclusiva para administradores.</p><button className="primary-btn" onClick={onBack}>Voltar ao perfil</button></div>;
   if (busy) return <div className="loading-stage"><span className="material-symbols-outlined">admin_panel_settings</span></div>;
+  if (pointEditor) return <CollectionPointFormScreen key={pointEditor.point?.id || 'new'} admin point={pointEditor.point} onBack={() => setPointEditor(null)} onSuccess={() => { setPointEditor(null); setTab('Pontos'); void load(); }} />;
   const totals = dashboard?.totals || {};
-  async function createCollectionPoint() {
-    const name = window.prompt('Nome do ponto de coleta:');
-    if (!name) return;
-    const street = window.prompt('Rua (opcional):') || '';
-    const number = window.prompt('Número (opcional):') || '';
-    const neighborhood = window.prompt('Bairro (opcional):') || '';
-    const city = window.prompt('Cidade:');
-    if (!city) return;
-    const state = window.prompt('Estado / UF (opcional):') || '';
-    const postalCode = window.prompt('CEP (opcional):') || '';
-    const categories = window.prompt('Materiais aceitos, separados por vírgula:', 'Eletrônicos, Plástico') || '';
-    const hours = window.prompt('Horário de funcionamento:', '08:00 - 17:00') || '';
-    try { await api.createAdminCollectionPoint({ name, street, number, neighborhood, city, state, postalCode, categories: categories.split(',').map((item) => item.trim()).filter(Boolean), hours }); await load(); } catch (error) { alert(error.message); }
-  }
-  async function editCollectionPoint(point) {
-    const name = window.prompt('Nome do ponto de coleta:', point.name);
-    if (!name) return;
-    const street = window.prompt('Rua (opcional):') || '';
-    const number = window.prompt('Número (opcional):') || '';
-    const neighborhood = window.prompt('Bairro (opcional):') || '';
-    const city = window.prompt('Cidade:', point.location);
-    if (!city) return;
-    const state = window.prompt('Estado / UF (opcional):') || '';
-    const postalCode = window.prompt('CEP (opcional):') || '';
-    const categories = window.prompt('Materiais aceitos, separados por vírgula:', point.categories.join(', ')) || '';
-    const hours = window.prompt('Horário de funcionamento:', point.hours) || '';
-    try { await api.updateAdminCollectionPoint(point.id, { name, street, number, neighborhood, city, state, postalCode, categories: categories.split(',').map((item) => item.trim()).filter(Boolean), hours }); await load(); } catch (error) { alert(error.message); }
+  function createCollectionPoint() { setPointEditor({ point: null }); }
+  function editCollectionPoint(point) { setPointEditor({ point }); }
+  async function removePost(post) {
+    if (!window.confirm(`Excluir o anúncio "${post.title}"? Essa ação não pode ser desfeita.`)) return;
+    setDeletingPostId(post.id);
+    try {
+      await api.removeAdminPost(post.id);
+      await load();
+    } catch (error) {
+      alert(error.message);
+    } finally {
+      setDeletingPostId(null);
+    }
   }
   async function removeCollectionPoint(point) {
     if (!window.confirm(`Excluir o ponto "${point.name}"?`)) return;
     try { await api.removeAdminCollectionPoint(point.id); await load(); } catch (error) { alert(error.message); }
   }
-  return <div className="admin-screen"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Administração</h1><button className="icon-btn" onClick={load}><span className="material-symbols-outlined">refresh</span></button></header><main className="page admin-page"><section className="admin-hero"><span className="eyebrow">Central de Administração</span><h2>Comunidade segura e circular</h2><p>Acompanhe conteúdos, usuários e contribuições da comunidade.</p></section><div className="segmented-tabs admin-tabs">{['Visão geral', 'Usuários', 'Anúncios', 'Denúncias', 'Pontos'].map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>)}</div>{tab === 'Visão geral' ? <><section className="admin-metrics">{[['group', totals.totalUsers, 'Usuários'], ['bolt', totals.activeUsers, 'Ativos (30 dias)'], ['inventory_2', totals.totalPosts, 'Anúncios'], ['volunteer_activism', totals.donations, 'Doações'], ['swap_horiz', totals.exchanges, 'Trocas'], ['flag', totals.reports, 'Denúncias pendentes']].map(([icon, value, label]) => <article key={label}><span className="material-symbols-outlined">{icon}</span><strong>{value || 0}</strong><small>{label}</small></article>)}</section><section className="admin-section"><h2>Categorias mais publicadas</h2>{dashboard?.categories?.map((item) => <div className="admin-row" key={item.category}><span>{item.category}</span><strong>{item.count}</strong></div>)}</section></> : null}{tab === 'Usuários' ? <section className="admin-section">{users.map((user) => <article className="admin-row" key={user.id}><div><strong>{user.name}</strong><small>{user.email} · {user.city}</small></div><button className={user.suspended ? 'secondary-btn' : 'danger-btn'} onClick={async () => { await api.setUserSuspension(user.id, !user.suspended); load(); }}>{user.suspended ? 'Reativar' : 'Suspender'}</button></article>)}</section> : null}{tab === 'Anúncios' ? <section className="admin-section">{posts.map((post) => <article className="admin-row" key={post.id}><div><strong>{post.title}</strong><small>{post.author?.name} · {post.status}</small></div><button className="danger-btn" onClick={async () => { if (window.confirm('Remover este anúncio?')) { await api.removeAdminPost(post.id); load(); } }}>Remover</button></article>)}</section> : null}{tab === 'Denúncias' ? <section className="admin-section">{reports.length ? reports.map((report) => <article className="admin-row report-row" key={report.id}><div><strong>{report.reason} · {report.targetType}</strong><small>{report.reporterName} · {report.details || 'Sem detalhes'}</small></div><select value={report.status} onChange={async (event) => { await api.updateReport(report.id, event.target.value); load(); }}><option value="pending">Pendente</option><option value="reviewed">Em análise</option><option value="resolved">Resolvida</option><option value="dismissed">Descartada</option></select></article>) : <EmptyState icon="flag" title="Nenhuma denúncia" text="A central está em dia." />}</section> : null}{tab === 'Pontos' ? <section className="admin-section"><div className="admin-section-heading"><h2>Pontos cadastrados</h2><button className="primary-btn compact" onClick={createCollectionPoint}><span className="material-symbols-outlined">add_location_alt</span>Novo ponto</button></div>{points.points?.length ? points.points.map((point) => <article className="admin-row" key={point.id}><div><strong>{point.name}</strong><small>{point.location} · {point.categories.join(', ')}</small></div><div><button className="secondary-btn" onClick={() => editCollectionPoint(point)}>Editar</button><button className="danger-btn" onClick={() => removeCollectionPoint(point)}>Excluir</button></div></article>) : <EmptyState icon="location_off" title="Nenhum ponto cadastrado" text="Cadastre o primeiro ponto verificado." />}<h2>Sugestões da comunidade</h2>{points.suggestions?.length ? points.suggestions.map((point) => <article className="admin-row" key={point.id}><div><strong>{point.name}</strong><small>{point.location} · {point.categories.join(', ')}</small></div>{point.status === 'pending' ? <div><button className="secondary-btn" onClick={async () => { await api.reviewPointSuggestion(point.id, 'rejected'); load(); }}>Recusar</button><button className="primary-btn" onClick={async () => { await api.reviewPointSuggestion(point.id, 'approved'); load(); }}>Aprovar</button></div> : <span>{point.status}</span>}</article>) : <EmptyState icon="add_location_alt" title="Nenhuma sugestão pendente" text="Novas sugestões aparecerão aqui." />}</section> : null}</main></div>;
+  async function removeUser(user) {
+    if (!window.confirm(`Excluir o usuário "${user.name}"? Esta ação não pode ser desfeita.`)) return;
+    setDeletingUserId(user.id);
+    try { await api.removeAdminUser(user.id); await load(); } catch (error) { alert(error.message); } finally { setDeletingUserId(null); }
+  }
+  return <div className="admin-screen"><UnifiedTopbar onBack={onBack} /><main className="page admin-page"><div className="segmented-tabs admin-tabs">{['Visão geral', 'Usuários', 'Anúncios', 'Denúncias', 'Pontos'].map((item) => <button key={item} className={tab === item ? 'active' : ''} onClick={() => setTab(item)}>{item}</button>)}</div>{tab === 'Visão geral' ? <><section className="admin-metrics">{[['group', totals.totalUsers, 'Usuários'], ['bolt', totals.activeUsers, 'Ativos (30 dias)'], ['inventory_2', totals.totalPosts, 'Anúncios'], ['volunteer_activism', totals.donations, 'Doações'], ['swap_horiz', totals.exchanges, 'Trocas'], ['flag', totals.reports, 'Denúncias pendentes']].map(([icon, value, label]) => <article key={label}><span className="material-symbols-outlined">{icon}</span><strong>{value || 0}</strong><small>{label}</small></article>)}</section><section className="admin-section"><h2>Categorias mais publicadas</h2>{dashboard?.categories?.map((item) => <div className="admin-row" key={item.category}><span>{item.category}</span><strong>{item.count}</strong></div>)}</section></> : null}{tab === 'Usuários' ? <section className="admin-section">{users.map((user) => <article className="admin-row" key={user.id}><div><strong>{user.name}</strong><small>{user.email} · {user.city}</small></div><div className="admin-user-actions"><button className={`admin-action-button ${user.suspended ? 'admin-action-reactivate' : 'admin-action-suspend'}`} onClick={async () => { await api.setUserSuspension(user.id, !user.suspended); load(); }}><span className="material-symbols-outlined">{user.suspended ? 'person_check' : 'person_off'}</span>{user.suspended ? 'Reativar' : 'Suspender'}</button><button className="admin-action-button admin-action-remove" onClick={() => removeUser(user)} disabled={deletingUserId === user.id}><span className="material-symbols-outlined">delete</span>{deletingUserId === user.id ? 'Excluindo...' : 'Excluir'}</button></div></article>)}</section> : null}{tab === 'Anúncios' ? <section className="admin-section">{posts.length ? posts.map((post) => <article className="admin-row" key={post.id}><div><strong>{post.title}</strong><small>{post.author?.name || 'Autor desconhecido'} · {post.status}</small></div><button className="admin-action-button admin-action-remove" onClick={() => removePost(post)} disabled={deletingPostId === post.id} aria-label={`Excluir anúncio ${post.title}`} title="Excluir anúncio"><span className="material-symbols-outlined">delete</span>{deletingPostId === post.id ? 'Excluindo...' : 'Excluir anúncio'}</button></article>) : <EmptyState icon="inventory_2" title="Nenhum anúncio" text="Não há anúncios cadastrados para administrar." />}</section> : null}{tab === 'Denúncias' ? <section className="admin-section">{reports.length ? reports.map((report) => <article className="admin-row report-row" key={report.id}><div><strong>{report.reason} · {report.targetType}</strong><small>{report.reporterName} · {report.details || 'Sem detalhes'}</small></div><select value={report.status} onChange={async (event) => { await api.updateReport(report.id, event.target.value); load(); }}><option value="pending">Pendente</option><option value="reviewed">Em análise</option><option value="resolved">Resolvida</option><option value="dismissed">Descartada</option></select></article>) : <EmptyState icon="flag" title="Nenhuma denúncia" text="A central está em dia." />}</section> : null}{tab === 'Pontos' ? <section className="admin-section"><div className="admin-section-heading"><h2>Pontos cadastrados</h2><button className="primary-btn compact" onClick={createCollectionPoint}><span className="material-symbols-outlined">add_location_alt</span>Novo ponto</button></div>{points.points?.length ? points.points.map((point) => <article className="admin-row" key={point.id}><div><strong>{point.name}</strong><small>{point.location} · {point.categories.join(', ')}</small></div><div className="admin-point-actions"><button className="secondary-btn admin-point-edit" onClick={() => editCollectionPoint(point)}><span className="material-symbols-outlined">edit</span>Editar</button><button className="danger-btn admin-point-delete" onClick={() => removeCollectionPoint(point)}><span className="material-symbols-outlined">delete</span>Excluir</button></div></article>) : <EmptyState icon="location_off" title="Nenhum ponto cadastrado" text="Cadastre o primeiro ponto verificado." />}<h2>Sugestões da comunidade</h2>{points.suggestions?.length ? points.suggestions.map((point) => <article className="admin-row" key={point.id}><div><strong>{point.name}</strong><small>{point.location} · {point.categories.join(', ')}</small></div>{point.status === 'pending' ? <div><button className="secondary-btn" onClick={async () => { await api.reviewPointSuggestion(point.id, 'rejected'); load(); }} >Recusar</button><button className="primary-btn" onClick={async () => { await api.reviewPointSuggestion(point.id, 'approved'); load(); }}>Aprovar</button></div> : <span>{point.status}</span>}</article>) : <EmptyState icon="add_location_alt" title="Nenhuma sugestão pendente" text="Novas sugestões aparecerão aqui." />}</section> : null}</main></div>;
 }
 
 function AboutScreen({ onBack }) {
-  return <div className="about-screen"><header className="topbar compact-topbar"><button className="back-btn" onClick={onBack}><span className="material-symbols-outlined">arrow_back_ios_new</span></button><h1>Sobre o ReUsa+</h1><span /></header><main className="page about-page"><section className="about-hero"><span className="material-symbols-outlined">recycling</span><span className="eyebrow">Economia circular</span><h1>Objetos podem ganhar novas histórias.</h1><p>O ReUsa+ conecta pessoas que desejam desapegar, reutilizar e descartar de forma responsável.</p></section><section><h2>O que é o ReUsa+?</h2><p>Uma rede colaborativa para encontrar quem precisa de algo que você não utiliza mais, estimular a reutilização e aproximar a comunidade de pontos de coleta.</p></section><section><h2>Como funciona?</h2><ol><li>Publique algo que não utiliza mais.</li><li>Pessoas próximas demonstram interesse.</li><li>Combine a entrega pelo chat.</li><li>Finalize a doação ou troca.</li><li>O item ganha nova utilidade em vez de ser descartado.</li></ol></section><section><h2>Por que reutilizar?</h2><p>Reutilizar prolonga a vida útil dos itens, evita descarte desnecessário e fortalece uma economia mais circular e solidária.</p></section></main></div>;
+  return <div className="about-screen"><UnifiedTopbar onBack={onBack} /><main className="page about-page"><section className="about-hero"><span className="material-symbols-outlined">recycling</span><span className="eyebrow">Economia circular</span><h1>Objetos podem ganhar novas histórias.</h1><p>O ReUsa+ conecta pessoas que desejam desapegar, reutilizar e descartar de forma responsável.</p></section><section><h2>O que é o ReUsa+?</h2><p>Uma rede colaborativa para encontrar quem precisa de algo que você não utiliza mais, estimular a reutilização e aproximar a comunidade de pontos de coleta.</p></section><section><h2>Como funciona?</h2><ol><li>Publique algo que não utiliza mais.</li><li>Pessoas próximas demonstram interesse.</li><li>Combine a entrega pelo chat.</li><li>Finalize a doação ou troca.</li><li>O item ganha nova utilidade em vez de ser descartado.</li></ol></section><section><h2>Por que reutilizar?</h2><p>Reutilizar prolonga a vida útil dos itens, evita descarte desnecessário e fortalece uma economia mais circular e solidária.</p></section></main></div>;
 }
 
 function EmptyState({ icon = 'inbox', title, text, action, onAction }) {
   return <section className="empty-state"><span className="material-symbols-outlined">{icon}</span><h2>{title}</h2><p>{text}</p>{action ? <button className="primary-btn" onClick={onAction}>{action}</button> : null}</section>;
 }
 
-function Field({ label, icon, value, onChange, placeholder, type = 'text', multiline = false, maxLength, autoFocus = false }) {
+function Field({ label, icon, value, onChange, placeholder, type = 'text', multiline = false, maxLength, minLength, required = false, autoFocus = false }) {
   return (
     <label className="field">
-      <span>{label}</span>
+      <span>{label}{required ? <strong className="required-mark" title="Campo obrigatório" aria-label="Campo obrigatório"> *</strong> : null}</span>
       <div className="field-control">
         <span className="material-symbols-outlined">{icon}</span>
-        {multiline ? <textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} rows={4} maxLength={maxLength} autoFocus={autoFocus} /> : <input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} maxLength={maxLength} autoFocus={autoFocus} />}
+        {multiline ? <textarea value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} rows={4} maxLength={maxLength} minLength={minLength} required={required} autoFocus={autoFocus} /> : <input type={type} value={value} onChange={(e) => onChange(e.target.value)} placeholder={placeholder} maxLength={maxLength} minLength={minLength} required={required} autoFocus={autoFocus} />}
       </div>
     </label>
   );

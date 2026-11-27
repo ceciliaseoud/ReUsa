@@ -1,7 +1,28 @@
+const { postExtras } = require('./community-api');
+// 
 const crypto = require('crypto');
 const jwt = require('jsonwebtoken');
 const { isLikelyResidentialAddress } = require('./location-validation');
 const { buildCollectionPointAddress, geocodeCollectionPoint } = require('./collection-point-geocoding');
+const stripe = require('../services/stripe-payments');
+const { VIDEO_POSTER, mediaError, uploadedUrl, parseMediaOrder, orderedMedia, rejectRemoteVideos } = require('./post-media');
+
+const DONATION_GOAL = 'Doa\u00e7\u00e3o';
+const SALE_GOAL = 'Venda';
+const POST_GOALS = new Set([DONATION_GOAL, 'Troca', SALE_GOAL]);
+
+function isValidEmailFormat(value) {
+  const email = String(value || '').trim();
+  if (email.length > 254 || email.includes('..')) return false;
+  const match = email.match(/^([^@\s]+)@([^@\s]+)$/);
+  if (!match) return false;
+  const [, localPart, domain] = match;
+  if (localPart.length > 64 || localPart.startsWith('.') || localPart.endsWith('.')) return false;
+  const labels = domain.split('.');
+  return labels.length >= 2
+    && labels.every((label) => label.length >= 1 && label.length <= 63 && !label.startsWith('-') && !label.endsWith('-') && /^[a-zA-Z0-9-]+$/.test(label))
+    && labels[labels.length - 1].length >= 2;
+}
 
 function id(prefix) {
   return `${prefix}-${crypto.randomUUID()}`;
@@ -16,37 +37,95 @@ function json(value, fallback = []) {
   }
 }
 
+function parseMoneyToCents(value) {
+  const normalized = String(value ?? '').trim().replace(/^R\$\s*/i, '').replace(/\./g, '').replace(',', '.');
+  if (!/^\d+(?:\.\d{1,2})?$/.test(normalized)) return null;
+  const amount = Number(normalized);
+  return Number.isFinite(amount) ? Math.round(amount * 100) : null;
+}
+
+async function postMedia(client, post, body, files = {}) {
+  rejectRemoteVideos(body);
+  const imageRows = (await client.query('SELECT image_url FROM post_images WHERE post_id=$1 ORDER BY sort_order,created_at', [post.id])).rows;
+  const existingImages = imageRows.length ? imageRows.map((image) => ({ url: image.image_url }))
+    : post.image_url && post.image_url !== VIDEO_POSTER ? [{ url: post.image_url }] : [];
+  const existingVideos = (await client.query('SELECT video_url,mime_type FROM post_videos WHERE post_id=$1 ORDER BY sort_order,created_at', [post.id])).rows
+    .map((video) => ({ url: video.video_url, mimeType: video.mime_type }));
+  const images = orderedMedia(existingImages, (files.images || []).map((file) => ({ url: uploadedUrl(file) })), parseMediaOrder(body?.imageOrder, 'fotos'), 8, 'fotos');
+  const videos = orderedMedia(existingVideos, (files.videos || []).map((file) => ({ url: uploadedUrl(file), mimeType: file.mimetype })), parseMediaOrder(body?.videoOrder, 'vídeos'), 2, 'vídeos');
+  if (!images.length && !videos.length) throw mediaError('Adicione pelo menos uma foto ou um vídeo do item.');
+  return { images, videos, cover: images[0]?.url || VIDEO_POSTER };
+}
+
+async function savePostMedia(client, postId, media) {
+  await client.query('DELETE FROM post_images WHERE post_id=$1', [postId]);
+  for (const [index, image] of media.images.entries()) await client.query('INSERT INTO post_images(id,post_id,image_url,sort_order) VALUES($1,$2,$3,$4)', [id('post-image'), postId, image.url, index]);
+  await client.query('DELETE FROM post_videos WHERE post_id=$1', [postId]);
+  for (const [index, video] of media.videos.entries()) await client.query('INSERT INTO post_videos(id,post_id,video_url,mime_type,sort_order) VALUES($1,$2,$3,$4,$5)', [id('post-video'), postId, video.url, video.mimeType, index]);
+}
+
 function userView(row) {
   if (!row) return null;
   return {
     id: row.id, name: row.name, email: row.email, city: row.city,
+    emailVerified: row.email_verified !== false,
     neighborhood: row.neighborhood || '', cep: row.cep || '', address: row.address || '',
     accountType: row.account_type || 'person', businessName: row.business_name || '',
     cnpj: row.cnpj || '', interests: json(row.interests_json), avatar: row.avatar || '',
     rating: Number(row.rating || 0), donations: Number(row.donations || 0),
     received: Number(row.received || 0), carbonSavedPercent: Number(row.carbon_saved_percent || 0),
     achievements: json(row.achievements_json), role: row.role || 'user',
-    suspended: Boolean(row.suspended), notificationPreferences: json(row.notification_preferences_json)
+    suspended: Boolean(row.suspended), notificationPreferences: json(row.notification_preferences_json),
+    stripeConnected: Boolean(row.stripe_account_id),
+    stripeDemoMode: stripe.demoEnabled(),
+    stripeTestMode: stripe.isTestEnvironment(),
+    stripePixEnabled: stripe.configured() && process.env.STRIPE_PIX_ENABLED === 'true'
+  };
+}
+
+function paymentView(payment) {
+  return {
+    id: payment.id,
+    negotiationId: payment.negotiation_id,
+    payerId: payment.payer_id,
+    payeeId: payment.payee_id,
+    amountCents: payment.amount_cents,
+    currency: payment.currency,
+    method: payment.method,
+    status: payment.status,
+    providerReference: payment.provider_reference,
+    checkoutUrl: payment.checkout_url,
+    failureCode: payment.failure_code,
+    createdAt: payment.created_at,
+    updatedAt: payment.updated_at,
+    paidAt: payment.paid_at
   };
 }
 
 async function postView(db, row, viewerId) {
-  const [author, interest, reputation, saved, liked] = await Promise.all([
+  const [author, interest, reputation, saved, liked, offer, images, videos] = await Promise.all([
     db.one('SELECT id,name,city,neighborhood,account_type,business_name,avatar FROM users WHERE id=$1', [row.author_id]),
     db.one("SELECT COUNT(*)::int AS count FROM negotiations WHERE post_id=$1 AND status IN ('interested','reserved','completed')", [row.id]),
     db.one('SELECT COALESCE(ROUND(AVG(rating),1),0)::float AS average, COUNT(*)::int AS count FROM reviews WHERE reviewee_id=$1', [row.author_id]),
     viewerId ? db.one('SELECT 1 FROM favorites WHERE user_id=$1 AND post_id=$2', [viewerId, row.id]) : null,
-    viewerId ? db.one('SELECT 1 FROM post_likes WHERE user_id=$1 AND post_id=$2', [viewerId, row.id]) : null
+    viewerId ? db.one('SELECT 1 FROM post_likes WHERE user_id=$1 AND post_id=$2', [viewerId, row.id]) : null,
+    viewerId ? db.one('SELECT proposal_status,proposal_amount_cents,proposal_method FROM negotiations WHERE post_id=$1 AND interested_id=$2 ORDER BY updated_at DESC LIMIT 1', [row.id, viewerId]) : null,
+    db.many('SELECT image_url FROM post_images WHERE post_id=$1 ORDER BY sort_order,created_at', [row.id]),
+    db.many('SELECT video_url,mime_type FROM post_videos WHERE post_id=$1 ORDER BY sort_order,created_at', [row.id])
   ]);
   return {
+    transport: JSON.parse(row.transport_json || '{}'), hasApproximateLocation: row.area_lat != null && row.area_lng != null,
     id: row.id, authorId: row.author_id,
     author: author && { id: author.id, name: author.name, city: author.city, neighborhood: author.neighborhood || '', accountType: author.account_type, businessName: author.business_name || '', avatar: author.avatar || '' },
     title: row.title, description: row.description, category: row.category, condition: row.condition,
-    goal: row.goal, imageUrl: row.image_url, likes: Number(row.likes), comments: Number(row.comments),
+    goal: row.goal, imageUrl: row.image_url, imageUrls: images.length ? images.map((image) => image.image_url) : row.image_url && row.image_url !== VIDEO_POSTER ? [row.image_url] : [], videos: videos.map((video) => ({ url: video.video_url, mimeType: video.mime_type })), likes: Number(row.likes), comments: Number(row.comments),
     location: row.location, createdAt: row.created_at, chipIcon: row.chip_icon, chipLabel: row.chip_label,
     status: row.status, views: Number(row.views || 0), interestedCount: Number(interest?.count || 0),
     saved: Boolean(saved), liked: Boolean(liked), updatedAt: row.updated_at || row.created_at,
-    authorReputation: Number(reputation?.average || 0), authorReviewCount: Number(reputation?.count || 0)
+    authorReputation: Number(reputation?.average || 0), authorReviewCount: Number(reputation?.count || 0),
+    offerStatus: offer?.proposal_status || 'none',
+    offerAmountCents: offer?.proposal_amount_cents || null,
+    offerMethod: offer?.proposal_method || null
   };
 }
 
@@ -63,7 +142,7 @@ function verifyPassword(password, stored) {
   return expected.length === actual.length && crypto.timingSafeEqual(actual, expected);
 }
 
-function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publisher, upload }) {
+function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publisher, upload, postUpload, sendVerificationEmail, sendPasswordResetEmail, verificationToken, sha256, isConfiguredAdminEmail = () => false }) {
   const authenticate = async (req, res, next) => {
     const token = String(req.headers.authorization || '').replace(/^Bearer\s+/, '');
     if (!token) return res.status(401).json({ error: 'Authentication required' });
@@ -91,25 +170,64 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
     }
     return next();
   };
-  const emit = async (client, type, data, correlationId) => {
-    const event = { id: id('event'), type, occurredAt: new Date().toISOString(), correlationId, data };
+  const emit = async (client, type, data, correlationId, occurredAt = new Date().toISOString()) => {
+    const event = { id: id('event'), type, occurredAt, correlationId, data };
     await client.query('INSERT INTO event_outbox(id,type,payload_json,correlation_id,created_at) VALUES($1,$2,$3,$4,$5)', [event.id, type, JSON.stringify(data), correlationId || 'system', event.occurredAt]);
     return event;
+  };
+  const messageNoticeLink = (threadId) => `/mensagens/ana?thread=${encodeURIComponent(threadId)}`;
+  const messageClearTimestamp = async (client, userId, threads) => {
+    const previous = (await client.query('SELECT MAX(cleared_at) AS cleared_at FROM message_clears WHERE user_id=$1', [userId])).rows[0];
+    return new Date(Math.max(Date.now(), previous?.cleared_at ? new Date(previous.cleared_at).getTime() : 0,
+      ...threads.map((thread) => thread.last_message_at ? new Date(thread.last_message_at).getTime() : 0))).toISOString();
+  };
+  const markMessageNoticesRead = async (client, userId, threadIds, readAt) => {
+    const links = threadIds.map(messageNoticeLink);
+    for (const table of ['notifications', 'notification_service_notifications']) {
+      await client.query(`UPDATE ${table} SET read_at=$1 WHERE user_id=$2 AND type='message' AND link=ANY($3::text[]) AND read_at IS NULL AND created_at <= $1`, [readAt, userId, links]);
+    }
+  };
+  const unreadMessagesForThread = async (userId, threadId) => {
+    const row = await db.one(`SELECT COUNT(*)::int AS count FROM (
+      SELECT type,link,created_at,read_at FROM notifications WHERE user_id=$1
+      UNION ALL SELECT type,link,created_at,read_at FROM notification_service_notifications WHERE user_id=$1
+    ) notices LEFT JOIN message_clears cleared ON cleared.user_id=$1 AND cleared.thread_id=$2
+    WHERE notices.type='message' AND notices.link=$3 AND notices.read_at IS NULL
+      AND (cleared.cleared_at IS NULL OR notices.created_at > cleared.cleared_at)`, [userId, threadId, messageNoticeLink(threadId)]);
+    return Number(row?.count || 0);
   };
 
   app.post('/api/auth/register', async (req, res, next) => {
     try {
       const { name, email, password, city, neighborhood = '', cep = '', address = '', interests = [], accountType = 'person', businessName = '', cnpj = '' } = req.body || {};
+      const normalizedName = String(name || '').trim();
       const normalizedEmail = String(email || '').trim().toLowerCase();
-      if (!String(name || '').trim() || !normalizedEmail || String(password || '').length < 8 || !String(city || '').trim()) return res.status(400).json({ error: 'Missing required fields' });
-      if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedEmail)) return res.status(400).json({ error: 'Invalid email address' });
-      const user = { id: id('user'), name: String(name).trim(), email: normalizedEmail, password_hash: passwordHash(password), city: String(city).trim(), neighborhood: String(neighborhood).trim(), cep: String(cep).trim(), address: String(address).trim(), account_type: accountType, business_name: String(businessName).trim(), cnpj: String(cnpj).replace(/\D/g, ''), interests_json: JSON.stringify(Array.isArray(interests) ? interests : []), avatar: '', achievements_json: JSON.stringify(['Novo membro']), created_at: new Date().toISOString(), last_active_at: new Date().toISOString() };
+      const normalizedPassword = String(password || '');
+      const normalizedCity = String(city || '').trim();
+      const normalizedAccountType = String(accountType || 'person').trim();
+      const normalizedBusinessName = String(businessName || '').trim();
+      const normalizedCnpj = String(cnpj || '').replace(/\D/g, '');
+      if (!normalizedName || !normalizedEmail || !normalizedPassword || !normalizedCity) return res.status(400).json({ error: 'Informe nome, e-mail, senha e cidade para criar a conta.' });
+      if (normalizedPassword.length < 8) return res.status(400).json({ error: 'A senha precisa ter pelo menos 8 caracteres.' });
+      if (!isValidEmailFormat(normalizedEmail)) return res.status(400).json({ error: 'Informe um e-mail válido, como nome@gmail.com, nome@outlook.com ou outro domínio existente.' });
+      const verification = verificationToken();
+      const user = { id: id('user'), name: normalizedName, email: normalizedEmail, password_hash: passwordHash(normalizedPassword), city: normalizedCity, neighborhood: String(neighborhood).trim(), cep: String(cep).trim(), address: String(address).trim(), account_type: normalizedAccountType, business_name: normalizedBusinessName, cnpj: normalizedCnpj, interests_json: JSON.stringify(Array.isArray(interests) ? interests : []), avatar: '', achievements_json: JSON.stringify(['Novo membro']), email_verified: false, email_verification_token_hash: verification.hash, email_verification_expires_at: verification.expiresAt, created_at: new Date().toISOString(), last_active_at: new Date().toISOString() };
       const created = await db.transaction(async (client) => {
-        if (await client.query('SELECT 1 FROM users WHERE lower(email)=lower($1)', [normalizedEmail]).then((r) => r.rowCount)) throw Object.assign(new Error('Email already registered'), { status: 409 });
-        await client.query(`INSERT INTO users (id,name,email,password_hash,city,neighborhood,cep,address,account_type,business_name,cnpj,interests_json,avatar,achievements_json,created_at,last_active_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16)`, Object.values(user));
+        if (await client.query('SELECT 1 FROM users WHERE lower(email)=lower($1)', [normalizedEmail]).then((r) => r.rowCount)) throw Object.assign(new Error('Este e-mail já está cadastrado.'), { status: 409 });
+        await client.query(`INSERT INTO users (id,name,email,password_hash,city,neighborhood,cep,address,account_type,business_name,cnpj,interests_json,avatar,achievements_json,email_verified,email_verification_token_hash,email_verification_expires_at,created_at,last_active_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)`, Object.values(user));
         return client.query('SELECT * FROM users WHERE id=$1', [user.id]).then((r) => r.rows[0]);
       });
-      return res.status(201).json({ token: createToken(created.id), user: userView(created) });
+      try {
+        await sendVerificationEmail(created.email, created.name, verification.raw, `${req.protocol}://${req.get('host')}`);
+      } catch (error) {
+        const requestId = req.correlationId || id('request');
+        console.error(`[registration-email-error] ${requestId}:`, error);
+        return res.status(503).json({
+          error: 'A conta foi criada, mas não foi possível enviar o e-mail de confirmação. Configure SMTP_HOST, SMTP_USER, SMTP_PASSWORD e EMAIL_FROM e solicite um novo envio.',
+          requestId
+        });
+      }
+      return res.status(201).json({ token: createToken(created.id), user: userView(created), verificationRequired: true });
     } catch (error) { return next(error); }
   });
 
@@ -117,11 +235,63 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
     try {
       const row = await db.one('SELECT * FROM users WHERE lower(email)=lower($1)', [String(req.body?.email || '').trim()]);
       if (!row || !verifyPassword(req.body?.password, row.password_hash)) return res.status(401).json({ error: 'Invalid credentials' });
+      if (row.email_verified === false) return res.status(403).json({ error: 'Confirme seu e-mail antes de entrar' });
       await db.query('UPDATE users SET last_active_at=now() WHERE id=$1', [row.id]);
       return res.json({ token: createToken(row.id), user: userView(row) });
     } catch (error) { return next(error); }
   });
+  app.post('/api/auth/forgot-password', async (req, res, next) => {
+    try {
+      const email = String(req.body?.email || '').trim().toLowerCase();
+      const generic = { message: 'Se existir uma conta com este e-mail, enviaremos um link para redefinir a senha.' };
+      if (!email || !isValidEmailFormat(email)) return res.json(generic);
+      const user = await db.one('SELECT id,name,email FROM users WHERE lower(email)=lower($1)', [email]);
+      if (!user) return res.json(generic);
+      const rawToken = crypto.randomBytes(32).toString('hex');
+      const expiresAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+      await db.query('UPDATE users SET password_reset_token_hash=$1,password_reset_expires_at=$2 WHERE id=$3', [sha256(rawToken), expiresAt, user.id]);
+      try {
+        await sendPasswordResetEmail(user.email, user.name, rawToken, `${req.protocol}://${req.get('host')}`);
+      } catch (error) {
+        const requestId = req.correlationId || id('request');
+        console.error(`[password-reset-email-error] ${requestId}:`, error);
+        return res.status(503).json({ error: 'Não foi possível enviar o e-mail de redefinição. Tente novamente mais tarde.', requestId });
+      }
+      return res.json(generic);
+    } catch (error) { return next(error); }
+  });
+  app.post('/api/auth/reset-password', async (req, res, next) => {
+    try {
+      const password = String(req.body?.password || '');
+      if (password.length < 8) return res.status(400).json({ error: 'A senha precisa ter pelo menos 8 caracteres.' });
+      const tokenHash = sha256(String(req.body?.token || ''));
+      const user = await db.one('SELECT id FROM users WHERE password_reset_token_hash=$1 AND password_reset_expires_at>now()', [tokenHash]);
+      if (!user) return res.status(400).json({ error: 'O link de redefinição é inválido ou expirou. Solicite um novo link.' });
+      await db.query('UPDATE users SET password_hash=$1,email_verified=true,password_reset_token_hash=NULL,password_reset_expires_at=NULL WHERE id=$2', [passwordHash(password), user.id]);
+      return res.json({ ok: true });
+    } catch (error) { return next(error); }
+  });
   app.get('/api/auth/me', authenticate, (req, res) => res.json({ user: req.user }));
+  app.get('/api/auth/verify-email', async (req, res, next) => {
+    try {
+      const tokenHash = sha256(String(req.query.token || ''));
+      const user = await db.one('SELECT id,email FROM users WHERE email_verification_token_hash=$1 AND email_verification_expires_at > now()', [tokenHash]);
+      if (!user) return res.status(400).send('Link de verificação inválido ou expirado. Solicite um novo link pelo aplicativo.');
+      await db.query('UPDATE users SET email_verified=true,email_verification_token_hash=NULL,email_verification_expires_at=NULL WHERE id=$1', [user.id]);
+      if (isConfiguredAdminEmail(user.email)) await db.query("UPDATE users SET role='admin' WHERE id=$1", [user.id]);
+      return res.redirect('/login#email_verified=1');
+    } catch (error) { return next(error); }
+  });
+  app.post('/api/auth/resend-verification', authenticate, async (req, res, next) => {
+    try {
+      const user = await db.one('SELECT * FROM users WHERE id=$1', [req.user.id]);
+      if (user.email_verified) return res.json({ emailVerified: true });
+      const verification = verificationToken();
+      await db.query('UPDATE users SET email_verification_token_hash=$1,email_verification_expires_at=$2 WHERE id=$3', [verification.hash, verification.expiresAt, user.id]);
+      await sendVerificationEmail(user.email, user.name, verification.raw, `${req.protocol}://${req.get('host')}`);
+      return res.json({ emailVerified: false, emailDelivered: true });
+    } catch (error) { return next(error); }
+  });
 
   app.get('/api/feed', optional, async (req, res, next) => {
     try { const rows = await db.many("SELECT * FROM posts WHERE status <> 'Encerrado' ORDER BY created_at DESC"); return res.json({ posts: await Promise.all(rows.map((row) => postView(db, row, req.user?.id))) }); } catch (error) { return next(error); }
@@ -135,7 +305,7 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
     } catch (error) { return next(error); }
   });
   app.get('/api/favorites', authenticate, async (req, res, next) => {
-    try { const rows = await db.many('SELECT p.* FROM favorites f JOIN posts p ON p.id=f.post_id WHERE f.user_id=$1 ORDER BY f.created_at DESC', [req.user.id]); return res.json({ posts: await Promise.all(rows.map((row) => postView(db, row, req.user.id))) }); } catch (error) { return next(error); }
+    try { const rows = await db.many("SELECT p.* FROM favorites f JOIN posts p ON p.id=f.post_id WHERE f.user_id=$1 AND p.status <> 'Encerrado' ORDER BY f.created_at DESC", [req.user.id]); return res.json({ posts: await Promise.all(rows.map((row) => postView(db, row, req.user.id))) }); } catch (error) { return next(error); }
   });
   app.post('/api/posts/:id/favorite', authenticate, async (req, res, next) => {
     try { const exists = await db.one('SELECT 1 FROM favorites WHERE user_id=$1 AND post_id=$2', [req.user.id, req.params.id]); if (exists) await db.query('DELETE FROM favorites WHERE user_id=$1 AND post_id=$2', [req.user.id, req.params.id]); else await db.query('INSERT INTO favorites(user_id,post_id,created_at) VALUES($1,$2,now()) ON CONFLICT DO NOTHING', [req.user.id, req.params.id]); return res.json({ saved: !exists }); } catch (error) { return next(error); }
@@ -151,17 +321,32 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
       return res.json(result);
     } catch (error) { return next(error); }
   });
-  app.post('/api/posts', authenticate, upload.single('image'), async (req, res, next) => {
+  app.post('/api/posts', authenticate, postUpload, async (req, res, next) => {
     try {
+      let extras; try {extras=postExtras(req.body,{requireTransport:true});} catch(error){return res.status(error.status||400).json({error:error.message});}
       const body = req.body || {};
-      const imageUrl = req.file ? (req.file.location || `/uploads/${req.file.filename}`) : String(body.imageUrl || '').trim();
-      if (!String(body.title || '').trim() || !String(body.description || '').trim() || !String(body.category || '').trim() || !imageUrl) return res.status(400).json({ error: 'Missing required fields' });
-      const post = { id: id('post'), author_id: req.user.id, title: String(body.title).trim(), description: String(body.description).trim(), category: String(body.category).trim(), condition: String(body.condition || 'Bom estado'), goal: String(body.goal || 'Doação'), image_url: imageUrl, location: String(body.location || req.user.city), created_at: new Date().toISOString(), chip_icon: String(body.chipIcon || 'volunteer_activism'), chip_label: String(body.chipLabel || body.goal || 'Doação') };
+      if (!String(body.title || '').trim() || !String(body.description || '').trim() || !String(body.category || '').trim()) return res.status(400).json({ error: 'Informe o título, a descrição e a categoria do item.' });
+      if (String(body.title).trim().length > 140 || String(body.description).trim().length > 3000 || String(body.category).trim().length > 60) return res.status(400).json({ error: 'One or more fields exceed the allowed length' });
+      const goal = String(body.goal || DONATION_GOAL).trim() || DONATION_GOAL;
+      if (!POST_GOALS.has(goal)) return res.status(400).json({ error: 'Goal must be Doação, Troca or Venda' });
+      const legacyImage = req.files?.images?.length ? '' : String(body.imageUrl || '').trim();
+      if (legacyImage && !/^https?:\/\//i.test(legacyImage) && !legacyImage.startsWith('/uploads/')) return res.status(400).json({ error: 'A URL da foto é inválida.' });
+      const post = { id: id('post'), author_id: req.user.id, title: String(body.title).trim(), description: String(body.description).trim(), category: String(body.category).trim(), condition: String(body.condition || 'Bom estado'), goal, image_url: legacyImage, location: String(body.location || req.user.city), created_at: new Date().toISOString(), chip_icon: String(body.chipIcon || (goal === 'Troca' ? 'swap_horiz' : goal === SALE_GOAL ? 'sell' : 'volunteer_activism')), chip_label: String(body.chipLabel || goal) };
       if (isLikelyResidentialAddress(post.location)) return res.status(400).json({ error: 'Location must be a city or neighborhood, not an exact address' });
-      const created = await db.transaction(async (client) => { await client.query('INSERT INTO posts(id,author_id,title,description,category,condition,goal,image_url,location,created_at,chip_icon,chip_label) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)', Object.values(post)); await client.query('INSERT INTO threads(id,post_id,participants_json,last_message_at) VALUES($1,$2,$3,$4)', [id('thread'), post.id, JSON.stringify([req.user.id]), post.created_at]); return client.query('SELECT * FROM posts WHERE id=$1', [post.id]).then((r) => r.rows[0]); });
+      const created = await db.transaction(async (client) => {
+        const media = await postMedia(client, post, body, req.files);
+        post.image_url = media.cover;
+        await client.query('INSERT INTO posts(id,author_id,title,description,category,condition,goal,image_url,location,created_at,chip_icon,chip_label) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)', Object.values(post));
+        await client.query('UPDATE posts SET transport_json=$1,area_lat=$2,area_lng=$3 WHERE id=$4',[extras.json,extras.lat,extras.lng,post.id]);
+        await savePostMedia(client, post.id, media);
+        await client.query('INSERT INTO threads(id,post_id,participants_json,last_message_at) VALUES($1,$2,$3,$4)', [id('thread'), post.id, JSON.stringify([req.user.id]), post.created_at]);
+        return client.query('SELECT * FROM posts WHERE id=$1', [post.id]).then((r) => r.rows[0]);
+      });
+      req.postMediaCommitted = true;
       return res.status(201).json({ post: await postView(db, created, req.user.id) });
-    } catch (error) { return next(error); }
+    } catch (error) { if (error.postMediaError) return res.status(400).json({ error: error.message }); return next(error); }
   });
+
   app.delete('/api/posts/:id', authenticate, async (req, res, next) => {
     try {
       const post = await db.one('SELECT id,author_id FROM posts WHERE id=$1', [req.params.id]);
@@ -175,57 +360,135 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
       return res.json({ ok: true });
     } catch (error) { return next(error); }
   });
-  app.put('/api/posts/:id', authenticate, upload.single('image'), async (req, res, next) => {
+  app.put('/api/posts/:id', authenticate, postUpload, async (req, res, next) => {
     try {
       const post = await db.one('SELECT * FROM posts WHERE id=$1', [req.params.id]);
       if (!post) return res.status(404).json({ error: 'Post not found' });
       if (post.author_id !== req.user.id) return res.status(403).json({ error: 'You can only edit your own posts' });
-      if (['Doado', 'Trocado', 'Encerrado'].includes(post.status)) return res.status(400).json({ error: 'Completed posts cannot be edited' });
-      const value = (key, fallback) => typeof req.body?.[key] === 'string' ? req.body[key].trim() : fallback;
-      const title = value('title', post.title);
-      const description = value('description', post.description);
-      const category = value('category', post.category);
-      const condition = value('condition', post.condition);
-      const goal = value('goal', post.goal);
-      const location = value('location', post.location);
-      if (!title || !description || !category) return res.status(400).json({ error: 'Title, description and category are required' });
-      if (title.length > 140 || description.length > 3000 || category.length > 60 || condition.length > 60 || goal.length > 40 || location.length > 160) return res.status(400).json({ error: 'One or more fields exceed the allowed length' });
-      if (isLikelyResidentialAddress(location)) return res.status(400).json({ error: 'Location must be a city or neighborhood, not an exact address' });
-      const imageUrl = req.file ? (req.file.location || `/uploads/${req.file.filename}`) : post.image_url;
-      const updated = await db.one('UPDATE posts SET title=$1,description=$2,category=$3,condition=$4,goal=$5,location=$6,image_url=$7,updated_at=now() WHERE id=$8 RETURNING *', [title, description, category, condition, goal, location, imageUrl, post.id]);
+      const updated = await db.transaction(async (client) => {
+        const locked = (await client.query('SELECT * FROM posts WHERE id=$1 FOR UPDATE', [post.id])).rows[0];
+        if (!locked) throw Object.assign(new Error('Post not found'), { status: 404 });
+        if (['Doado', 'Trocado', 'Vendido', 'Encerrado'].includes(locked.status)) throw mediaError('Completed posts cannot be edited');
+        const value = (key, fallback) => typeof req.body?.[key] === 'string' ? req.body[key].trim() : fallback;
+        const title = value('title', locked.title), description = value('description', locked.description);
+        const category = value('category', locked.category), condition = value('condition', locked.condition);
+        const goal = value('goal', locked.goal), location = value('location', locked.location);
+        if (!title || !description || !category) throw mediaError('Title, description and category are required');
+        if (title.length > 140 || description.length > 3000 || category.length > 60 || condition.length > 60 || goal.length > 40 || location.length > 160) throw mediaError('One or more fields exceed the allowed length');
+        if (!POST_GOALS.has(goal)) throw mediaError('Goal must be Doação, Troca or Venda');
+        if (isLikelyResidentialAddress(location)) throw mediaError('Location must be a city or neighborhood, not an exact address');
+        const media = await postMedia(client, locked, req.body, req.files);
+        const row = (await client.query('UPDATE posts SET title=$1,description=$2,category=$3,condition=$4,goal=$5,location=$6,image_url=$7,updated_at=now() WHERE id=$8 RETURNING *', [title, description, category, condition, goal, location, media.cover, locked.id])).rows[0];
+        await savePostMedia(client, locked.id, media);
+        return row;
+      });
+      req.postMediaCommitted = true;
       return res.json({ post: await postView(db, updated, req.user.id) });
-    } catch (error) { return next(error); }
+    } catch (error) { if (error.postMediaError || error.status === 404) return res.status(error.status || 400).json({ error: error.message }); return next(error); }
   });
+
   app.get('/api/posts/:id/interested', authenticate, async (req, res, next) => {
     try {
       const post = await db.one('SELECT id,author_id FROM posts WHERE id=$1', [req.params.id]);
       if (!post) return res.status(404).json({ error: 'Post not found' });
       if (post.author_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can view interested users' });
-      const rows = await db.many('SELECT n.id,n.status,n.created_at,n.thread_id,u.id AS user_id,u.name,u.city,u.avatar FROM negotiations n JOIN users u ON u.id=n.interested_id WHERE n.post_id=$1 ORDER BY n.created_at DESC', [post.id]);
-      return res.json({ negotiations: rows.map((row) => ({ id: row.id, status: row.status, createdAt: row.created_at, threadId: row.thread_id, user: { id: row.user_id, name: row.name, city: row.city, avatar: row.avatar || '' } })) });
+      const rows = await db.many('SELECT n.id,n.status,NOT EXISTS(SELECT 1 FROM collection_deliveries d WHERE d.negotiation_id=n.id) AND NOT EXISTS(SELECT 1 FROM payments p WHERE p.negotiation_id=n.id) AS can_cancel_acceptance,n.proposal_status,n.proposal_amount_cents,n.proposal_method,n.proposal_created_at,n.created_at,n.thread_id,u.id AS user_id,u.name,u.city,u.avatar FROM negotiations n JOIN users u ON u.id=n.interested_id WHERE n.post_id=$1 ORDER BY n.created_at DESC', [post.id]);
+      return res.json({ negotiations: rows.map((row) => ({ id: row.id, status: row.status, canCancelAcceptance: row.status === 'reserved' && row.proposal_status === 'accepted' && Boolean(row.can_cancel_acceptance), proposalStatus: row.proposal_status || 'none', proposalAmountCents: row.proposal_amount_cents || null, proposalMethod: row.proposal_method || null, proposalCreatedAt: row.proposal_created_at || null, createdAt: row.created_at, threadId: row.thread_id, user: { id: row.user_id, name: row.name, city: row.city, avatar: row.avatar || '' } })) });
     } catch (error) { return next(error); }
   });
   app.get('/api/posts/:id/negotiation', authenticate, async (req, res, next) => {
     try {
-      const post = await db.one('SELECT id FROM posts WHERE id=$1', [req.params.id]);
+      const post = await db.one('SELECT id,goal FROM posts WHERE id=$1', [req.params.id]);
       if (!post) return res.status(404).json({ error: 'Post not found' });
-      const negotiation = await db.one('SELECT id,status,owner_id,interested_id,completed_at FROM negotiations WHERE post_id=$1 AND (owner_id=$2 OR interested_id=$2) ORDER BY updated_at DESC LIMIT 1', [post.id, req.user.id]);
-      return res.json({ negotiation: negotiation ? { id: negotiation.id, status: negotiation.status, ownerId: negotiation.owner_id, interestedId: negotiation.interested_id, completedAt: negotiation.completed_at } : null });
+      const negotiation = await db.one("SELECT id,status,thread_id,owner_id,interested_id,completed_at,proposal_status,proposal_amount_cents,proposal_method,proposal_created_at FROM negotiations WHERE post_id=$1 AND (owner_id=$2 OR interested_id=$2) ORDER BY CASE WHEN status='reserved' THEN 0 WHEN status='completed' THEN 1 ELSE 2 END, updated_at DESC LIMIT 1", [post.id, req.user.id]);
+      const canCancelOffer=Boolean(negotiation&&post.goal===SALE_GOAL&&negotiation.interested_id===req.user.id&&negotiation.status==='interested'&&negotiation.proposal_status==='pending'&&!await db.one('SELECT id FROM collection_deliveries WHERE negotiation_id=$1',[negotiation.id])&&!await db.one('SELECT id FROM payments WHERE negotiation_id=$1 LIMIT 1',[negotiation.id]));
+      return res.json({ negotiation: negotiation ? { id: negotiation.id, status: negotiation.status, threadId: negotiation.thread_id, ownerId: negotiation.owner_id, interestedId: negotiation.interested_id, canCancelOffer, completedAt: negotiation.completed_at, proposalStatus: negotiation.proposal_status || 'none', proposalAmountCents: negotiation.proposal_amount_cents || null, proposalMethod: negotiation.proposal_method || null, proposalCreatedAt: negotiation.proposal_created_at || null } : null });
     } catch (error) { return next(error); }
   });
-  app.patch('/api/posts/:id/status', authenticate, async (req, res, next) => {
+  app.post('/api/negotiations/:id/proposal', authenticate, async (req, res, next) => {
     try {
-      const status = String(req.body?.status || '').trim();
-      const post = await db.one('SELECT * FROM posts WHERE id=$1', [req.params.id]);
-      if (!post) return res.status(404).json({ error: 'Post not found' });
-      if (post.author_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can change this status' });
-      if (!['Disponível', 'Encerrado'].includes(status)) return res.status(400).json({ error: 'Use the reservation or completion flow for this status' });
+      const amountCents = req.body?.amountCents !== undefined
+        ? Number(req.body.amountCents)
+        : parseMoneyToCents(req.body?.amount);
+      const method = String(req.body?.method || '').trim().toLowerCase();
+      if (!Number.isSafeInteger(amountCents) || amountCents < 100 || amountCents > 100000000) return res.status(400).json({ error: 'Amount must be between R$ 1,00 and R$ 1.000.000,00' });
+      if (!['pix', 'card'].includes(method)) return res.status(400).json({ error: 'Use pix ou cartão' });
+      if (method === 'pix' && process.env.STRIPE_PIX_ENABLED !== 'true') return res.status(409).json({ error: 'Pix ainda não está habilitado nesta integração Stripe. Escolha cartão.' });
       const updated = await db.transaction(async (client) => {
-        const row = await client.query('UPDATE posts SET status=$1,reserved_by=CASE WHEN $1=$2 THEN NULL ELSE reserved_by END,updated_at=now() WHERE id=$3 RETURNING *', [status, 'Disponível', post.id]);
-        if (status === 'Disponível') await client.query("UPDATE negotiations SET status='interested',updated_at=now() WHERE post_id=$1 AND status='reserved'", [post.id]);
-        return row.rows[0];
+        const target=(await client.query('SELECT post_id FROM negotiations WHERE id=$1',[req.params.id])).rows[0];
+        if(!target)throw Object.assign(new Error('Negotiation not found'),{status:404});
+        const post=(await client.query('SELECT title,goal,status FROM posts WHERE id=$1 FOR UPDATE',[target.post_id])).rows[0];
+        const negotiation=(await client.query('SELECT * FROM negotiations WHERE id=$1 FOR UPDATE',[req.params.id])).rows[0];
+        if(negotiation.interested_id!==req.user.id)throw Object.assign(new Error('Only the interested user can send this proposal'),{status:403});
+        const resending=negotiation.status==='cancelled'&&negotiation.proposal_status==='cancelled';
+        if(negotiation.proposal_status&&negotiation.proposal_status!=='none'&&!resending)throw Object.assign(new Error('Você já enviou uma oferta para este anúncio.'),{status:409});
+        if(negotiation.status!=='interested'&&!resending)throw Object.assign(new Error('This negotiation is no longer accepting proposals'),{status:400});
+        if(!post||post.goal!==SALE_GOAL)throw Object.assign(new Error('Money offers are only available for items marked for sale'),{status:400});
+        if(resending&&(post.status!=='Disponível'||(await client.query("SELECT id FROM collection_deliveries WHERE negotiation_id=$1 AND status<>'cancelled'",[negotiation.id])).rows[0]||(await client.query("SELECT id FROM payments WHERE negotiation_id=$1 AND status IN ('processing','succeeded') LIMIT 1",[negotiation.id])).rows[0]))throw Object.assign(new Error('Esta negociação não está disponível para uma nova oferta.'),{status:409});
+        const previousCreatedAt=new Date(negotiation.proposal_created_at||0).getTime();
+        const createdAt=new Date(Math.max(Date.now(),Number.isFinite(previousCreatedAt)?previousCreatedAt+1:0)).toISOString();
+        const result = await client.query("UPDATE negotiations SET status='interested',proposal_status=$1,proposal_amount_cents=$2,proposal_method=$3,proposal_created_at=$4,updated_at=$4 WHERE id=$5 RETURNING *", ['pending', amountCents, method, createdAt, negotiation.id]);
+        await emit(client, 'negotiation.proposal_created', { negotiationId: negotiation.id, postId: negotiation.post_id, postTitle: post.title || 'anúncio', ownerId: negotiation.owner_id, interestedId: negotiation.interested_id, amountCents, method }, req.correlationId);
+        return result.rows[0];
       });
-      return res.json({ post: await postView(db, updated, req.user.id) });
+      queueMicrotask(() => publisher?.flush?.());
+      return res.status(201).json({ proposal: { negotiationId: updated.id, status: updated.proposal_status, amountCents: updated.proposal_amount_cents, method: updated.proposal_method, createdAt: updated.proposal_created_at } });
+    } catch (error) { if(error?.status)return res.status(error.status).json({error:error.message});return next(error); }
+  });
+  app.patch('/api/negotiations/:id/proposal', authenticate, async (req, res, next) => {
+    try {
+      const decision = String(req.body?.decision || '').trim().toLowerCase();
+      if (!['accepted', 'rejected'].includes(decision)) return res.status(400).json({ error: 'Decision must be accepted or rejected' });
+      const result = await db.transaction(async (client) => {
+        // Lock the post before the negotiation so competing offers cannot both reserve it.
+        const target = (await client.query('SELECT post_id FROM negotiations WHERE id=$1', [req.params.id])).rows[0];
+        if (!target) throw Object.assign(new Error('Negotiation not found'), { status: 404 });
+        const post = (await client.query('SELECT * FROM posts WHERE id=$1 FOR UPDATE', [target.post_id])).rows[0];
+        if (!post) throw Object.assign(new Error('Post not found'), { status: 404 });
+        const negotiation = (await client.query('SELECT * FROM negotiations WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
+        if (negotiation.owner_id !== req.user.id || post.author_id !== req.user.id) throw Object.assign(new Error('Only the seller can decide this proposal'), { status: 403 });
+        if (post.goal === SALE_GOAL) {
+          const expected = typeof req.body?.expectedProposalCreatedAt === 'string' ? Date.parse(req.body.expectedProposalCreatedAt) : NaN;
+          if (!Number.isFinite(expected)) throw Object.assign(new Error('Atualize a oferta antes de responder.'), { status: 400 });
+          if (new Date(negotiation.proposal_created_at).getTime() !== expected) throw Object.assign(new Error('A oferta foi atualizada. Confira o valor e a forma de pagamento antes de responder.'), { status: 409 });
+        }
+        if (negotiation.proposal_status !== 'pending' && !(decision === 'accepted' && negotiation.proposal_status === 'rejected')) throw Object.assign(new Error('There is no pending proposal to decide'), { status: 400 });
+        if (decision === 'accepted') {
+          if (post.goal !== SALE_GOAL) throw Object.assign(new Error('Only sale offers can be accepted here'), { status: 400 });
+          if (!['Disponível', 'Reservado'].includes(post.status) ||
+              (post.status === 'Reservado' && post.reserved_by !== negotiation.interested_id) ||
+              !['interested', 'reserved'].includes(negotiation.status)) {
+            throw Object.assign(new Error('Este anúncio já está reservado para outra pessoa ou não está disponível.'), { status: 409 });
+          }
+          if (stripe.configured() && !stripe.demoEnabled()) {
+            const seller = (await client.query('SELECT stripe_account_id FROM users WHERE id=$1', [req.user.id])).rows[0];
+            if (!seller?.stripe_account_id) throw Object.assign(new Error('Conecte sua conta Stripe para receber pagamentos.'), { status: 409 });
+          }
+          await client.query("UPDATE negotiations SET status='interested',proposal_status=CASE WHEN proposal_status='pending' THEN 'rejected' ELSE proposal_status END,updated_at=now() WHERE post_id=$1 AND id<>$2 AND status='reserved'", [post.id, negotiation.id]);
+          await client.query("UPDATE negotiations SET proposal_status='accepted',status='reserved',updated_at=now() WHERE id=$1", [negotiation.id]);
+          await client.query("UPDATE posts SET status='Reservado',reserved_by=$1,updated_at=now() WHERE id=$2", [negotiation.interested_id, post.id]);
+          await emit(client, 'negotiation.reserved', { negotiationId: negotiation.id, postId: post.id, postTitle: post.title, ownerId: post.author_id, interestedId: negotiation.interested_id, status: 'reserved' }, req.correlationId);
+        } else {
+          await client.query("UPDATE negotiations SET proposal_status='rejected',updated_at=now() WHERE id=$1", [negotiation.id]);
+        }
+        return { negotiation, decision };
+      });
+      queueMicrotask(() => publisher?.flush?.());
+      return res.json({ proposal: { negotiationId: result.negotiation.id, status: result.decision, amountCents: result.negotiation.proposal_amount_cents, method: result.negotiation.proposal_method, createdAt: result.negotiation.proposal_created_at }, reserved: decision === 'accepted' });
+    } catch (error) {
+      if (error?.status) return res.status(error.status).json({ error: error.message });
+      return next(error);
+    }
+  });
+  app.get('/api/profile/payment-items', authenticate, async (req, res, next) => {
+    try {
+      const rows = await db.many(`SELECT n.id AS negotiation_id,n.status,n.proposal_status,n.proposal_amount_cents,n.proposal_method,n.proposal_created_at,p.id AS post_id,p.title,p.image_url,p.location
+        FROM negotiations n JOIN posts p ON p.id=n.post_id
+        WHERE p.status <> 'Encerrado' AND n.interested_id=$1 AND n.proposal_status IN ('pending','accepted') AND n.status IN ('interested','reserved')
+        ORDER BY n.updated_at DESC`, [req.user.id]);
+      const payments = await db.many(`SELECT negotiation_id,status,checkout_url FROM payments WHERE payer_id=$1 AND status IN ('processing','failed') ORDER BY created_at DESC`, [req.user.id]);
+      const paymentByNegotiation = new Map(payments.map((payment) => [payment.negotiation_id, payment]));
+      return res.json({ items: rows.map((row) => ({ negotiationId: row.negotiation_id, postId: row.post_id, title: row.title, imageUrl: row.image_url, location: row.location, negotiationStatus: row.status, proposalStatus: row.proposal_status, amountCents: row.proposal_amount_cents, method: row.proposal_method, createdAt: row.proposal_created_at, payment: paymentByNegotiation.get(row.negotiation_id) || null })) });
     } catch (error) { return next(error); }
   });
   app.post('/api/posts/:id/reserve', authenticate, async (req, res, next) => {
@@ -234,11 +497,20 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
         const postResult = await client.query('SELECT * FROM posts WHERE id=$1 FOR UPDATE', [req.params.id]);
         const post = postResult.rows[0]; if (!post) throw Object.assign(new Error('Post not found'), { status: 404 });
         if (post.author_id !== req.user.id) throw Object.assign(new Error('Only the owner can reserve this post'), { status: 403 });
+        if (post.goal === SALE_GOAL && stripe.configured() && !stripe.demoEnabled()) {
+          const seller = (await client.query('SELECT stripe_account_id FROM users WHERE id=$1', [req.user.id])).rows[0];
+          if (!seller?.stripe_account_id) throw Object.assign(new Error('Conecte sua conta Stripe antes de reservar o anúncio.'), { status: 409 });
+        }
         if (!['Disponível', 'Reservado'].includes(post.status)) throw Object.assign(new Error('This post is no longer available'), { status: 400 });
         const negotiation = (await client.query("SELECT * FROM negotiations WHERE post_id=$1 AND interested_id=$2 AND status <> 'cancelled'", [post.id, req.body?.interestedId])).rows[0];
         if (!negotiation) throw Object.assign(new Error('Choose a user who demonstrated interest'), { status: 400 });
+        if (post.goal === SALE_GOAL) {
+          const expected = typeof req.body?.expectedProposalCreatedAt === 'string' ? Date.parse(req.body.expectedProposalCreatedAt) : NaN;
+          if (!Number.isFinite(expected)) throw Object.assign(new Error('Atualize a oferta antes de reservar o item.'), { status: 400 });
+          if (new Date(negotiation.proposal_created_at).getTime() !== expected) throw Object.assign(new Error('A oferta foi atualizada. Confira o valor e a forma de pagamento antes de reservar.'), { status: 409 });
+        }
         await client.query("UPDATE negotiations SET status='interested',updated_at=now() WHERE post_id=$1 AND status='reserved'", [post.id]);
-        await client.query("UPDATE negotiations SET status='reserved',updated_at=now() WHERE id=$1", [negotiation.id]);
+        await client.query("UPDATE negotiations SET status='reserved',proposal_status=CASE WHEN proposal_status='pending' THEN 'accepted' ELSE proposal_status END,updated_at=now() WHERE id=$1", [negotiation.id]);
         await client.query("UPDATE posts SET status='Reservado',reserved_by=$1,updated_at=now() WHERE id=$2", [negotiation.interested_id, post.id]);
         await emit(client, 'negotiation.reserved', { negotiationId: negotiation.id, postId: post.id, postTitle: post.title, ownerId: post.author_id, interestedId: negotiation.interested_id, status: 'reserved' }, req.correlationId);
         return client.query('SELECT * FROM posts WHERE id=$1', [post.id]).then((r) => r.rows[0]);
@@ -267,23 +539,35 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
   });
   app.get('/api/messages/threads', authenticate, async (req, res, next) => {
     try {
-      const rows = await db.many(`SELECT t.id,t.post_id,t.last_message_at,t.unread_count,
+      const rows = await db.many(`WITH notices AS (
+        SELECT type,link,created_at,read_at FROM notifications WHERE user_id=$1
+        UNION ALL SELECT type,link,created_at,read_at FROM notification_service_notifications WHERE user_id=$1
+      ) SELECT t.id,t.post_id,t.last_message_at,
+        (SELECT COUNT(*)::int FROM notices WHERE type='message' AND read_at IS NULL
+          AND link='/mensagens/ana?thread=' || t.id
+          AND (cleared.cleared_at IS NULL OR created_at > cleared.cleared_at)) AS unread_count,
         p.title AS post_title, u.id AS other_user_id,u.name AS other_user_name,u.avatar AS other_user_avatar,
-        last_message.text AS last_message_text
+        last_message.text AS last_message_text,last_message.sent_at AS last_message_sent_at
         FROM threads t
         JOIN posts p ON p.id=t.post_id
         JOIN LATERAL jsonb_array_elements_text(t.participants_json::jsonb) participant ON true
         JOIN users u ON u.id=participant AND u.id <> $1
-        LEFT JOIN LATERAL (SELECT text FROM messages WHERE thread_id=t.id ORDER BY sent_at DESC LIMIT 1) last_message ON true
+        LEFT JOIN message_clears cleared ON cleared.user_id=$1 AND cleared.thread_id=t.id
+        LEFT JOIN LATERAL (
+          SELECT text,sent_at FROM messages
+          WHERE thread_id=t.id AND (cleared.cleared_at IS NULL OR sent_at > cleared.cleared_at)
+          ORDER BY sent_at DESC LIMIT 1
+        ) last_message ON true
         WHERE t.participants_json::jsonb @> $2::jsonb
-        ORDER BY t.last_message_at DESC`, [req.user.id, JSON.stringify([req.user.id])]);
+          AND (cleared.cleared_at IS NULL OR last_message.sent_at IS NOT NULL)
+        ORDER BY COALESCE(last_message.sent_at, t.last_message_at) DESC`, [req.user.id, JSON.stringify([req.user.id])]);
       return res.json({ threads: rows.map((row) => ({
         id: row.id,
         postId: row.post_id,
         title: row.other_user_name,
         avatar: row.other_user_avatar || '',
         subtitle: row.last_message_text || row.post_title,
-        time: row.last_message_at,
+        time: row.last_message_sent_at || row.last_message_at,
         unreadCount: Number(row.unread_count || 0)
       })) });
     } catch (error) { return next(error); }
@@ -292,11 +576,43 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
     try {
       const thread = await db.one('SELECT * FROM threads WHERE id=$1 AND participants_json::jsonb @> $2::jsonb', [req.params.id, JSON.stringify([req.user.id])]);
       if (!thread) return res.status(404).json({ error: 'Thread not found' });
-      const messages = await db.many('SELECT * FROM messages WHERE thread_id=$1 ORDER BY sent_at ASC', [thread.id]);
-      await db.query('UPDATE threads SET unread_count=0 WHERE id=$1', [thread.id]);
+      const clear = await db.one('SELECT cleared_at FROM message_clears WHERE user_id=$1 AND thread_id=$2', [req.user.id, thread.id]);
+      const messages = clear
+        ? await db.many('SELECT * FROM messages WHERE thread_id=$1 AND sent_at > $2 ORDER BY sent_at ASC', [thread.id, clear.cleared_at])
+        : await db.many('SELECT * FROM messages WHERE thread_id=$1 ORDER BY sent_at ASC', [thread.id]);
+      const unreadCount = await unreadMessagesForThread(req.user.id, thread.id);
       const otherUserId = json(thread.participants_json).find((item) => item !== req.user.id);
       const otherUser = otherUserId ? await db.one('SELECT id,name,avatar FROM users WHERE id=$1', [otherUserId]) : null;
-      return res.json({ thread: { ...thread, title: otherUser?.name || 'Conversa', avatar: otherUser?.avatar || '' }, participants: json(thread.participants_json), messages });
+      return res.json({ thread: { ...thread, unread_count: unreadCount, title: otherUser?.name || 'Conversa', avatar: otherUser?.avatar || '' }, participants: json(thread.participants_json), messages });
+    } catch (error) { return next(error); }
+  });
+  app.delete('/api/messages/threads/:id/messages', authenticate, async (req, res, next) => {
+    try {
+      const clearedAt = await db.transaction(async (client) => {
+        const thread = (await client.query('SELECT id,last_message_at FROM threads WHERE id=$1 AND participants_json::jsonb @> $2::jsonb FOR UPDATE', [req.params.id, JSON.stringify([req.user.id])])).rows[0];
+        if (!thread) throw Object.assign(new Error('Thread not found'), { status: 404 });
+        const timestamp = await messageClearTimestamp(client, req.user.id, [thread]);
+        await client.query(`INSERT INTO message_clears(user_id,thread_id,cleared_at) VALUES($1,$2,$3)
+          ON CONFLICT(user_id,thread_id) DO UPDATE SET cleared_at=EXCLUDED.cleared_at`, [req.user.id, thread.id, timestamp]);
+        await markMessageNoticesRead(client, req.user.id, [thread.id], timestamp);
+        return timestamp;
+      });
+      return res.json({ ok: true, clearedAt });
+    } catch (error) { if (error.status === 404) return res.status(404).json({ error: error.message }); return next(error); }
+  });
+  app.delete('/api/messages/threads', authenticate, async (req, res, next) => {
+    try {
+      const clearedAt = await db.transaction(async (client) => {
+        const rows = (await client.query('SELECT id,last_message_at FROM threads WHERE participants_json::jsonb @> $1::jsonb ORDER BY id FOR UPDATE', [JSON.stringify([req.user.id])])).rows;
+        const timestamp = await messageClearTimestamp(client, req.user.id, rows);
+        const threadIds = rows.map((thread) => thread.id);
+        await client.query(`INSERT INTO message_clears(user_id,thread_id,cleared_at)
+          SELECT $1,t.id,$3::timestamptz FROM threads t WHERE t.id=ANY($2::text[])
+          ON CONFLICT(user_id,thread_id) DO UPDATE SET cleared_at=EXCLUDED.cleared_at`, [req.user.id, threadIds, timestamp]);
+        await markMessageNoticesRead(client, req.user.id, threadIds, timestamp);
+        return timestamp;
+      });
+      return res.json({ ok: true, clearedAt });
     } catch (error) { return next(error); }
   });
   app.post('/api/messages/threads/:id/messages', authenticate, async (req, res, next) => {
@@ -308,29 +624,42 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
       const message = { id: id('msg'), thread_id: thread.id, sender_id: req.user.id, text, sent_at: new Date().toISOString(), status: 'sent' };
       const recipientId = json(thread.participants_json).find((item) => item !== req.user.id);
       await db.transaction(async (client) => {
+        // Sending and clearing use the same lock, so a concurrent message and
+        // its notification fall on the same side of the clear watermark.
+        const locked = await client.query('SELECT id FROM threads WHERE id=$1 FOR UPDATE', [thread.id]);
+        if (!locked.rowCount) throw Object.assign(new Error('Thread not found'), { status: 404 });
+        const lastClear = (await client.query('SELECT MAX(cleared_at) AS cleared_at FROM message_clears WHERE thread_id=$1', [thread.id])).rows[0];
+        message.sent_at = new Date(Math.max(Date.now(), lastClear?.cleared_at ? new Date(lastClear.cleared_at).getTime() + 1 : 0)).toISOString();
         await client.query('INSERT INTO messages(id,thread_id,sender_id,text,sent_at,status) VALUES($1,$2,$3,$4,$5,$6)', Object.values(message));
         await client.query('UPDATE threads SET last_message_at=$1,unread_count=unread_count+1 WHERE id=$2', [message.sent_at, thread.id]);
-        if (recipientId) await emit(client, 'message.sent', { messageId: message.id, threadId: thread.id, postId: thread.post_id, senderId: req.user.id, senderName: req.user.name, recipientId }, req.correlationId);
+        if (recipientId) await emit(client, 'message.sent', { messageId: message.id, threadId: thread.id, postId: thread.post_id, senderId: req.user.id, senderName: req.user.name, recipientId }, req.correlationId, message.sent_at);
       });
       queueMicrotask(() => publisher?.flush?.());
       return res.status(201).json({ message });
-    } catch (error) { return next(error); }
+    } catch (error) { if (error.status === 404) return res.status(404).json({ error: error.message }); return next(error); }
   });
   app.get('/api/notifications', authenticate, async (req, res, next) => {
     try {
-      const rows = await db.many('SELECT id,type,title,text,link,created_at AS "createdAt",read_at AS "readAt" FROM notification_service_notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100', [req.user.id]);
-      return res.json({ notifications: rows });
+      const rows = await db.many(`SELECT notices.id,notices.type,notices.title,notices.text,notices.link,notices.created_at AS "createdAt",
+        COALESCE(notices.read_at, CASE WHEN notices.created_at <= cleared.cleared_at THEN cleared.cleared_at END) AS "readAt"
+        FROM (SELECT id,type,title,text,link,created_at,read_at FROM notifications WHERE user_id=$1
+          UNION ALL SELECT id,type,title,text,link,created_at,read_at FROM notification_service_notifications WHERE user_id=$1) notices
+        LEFT JOIN message_clears cleared ON cleared.user_id=$1 AND notices.type='message' AND notices.link='/mensagens/ana?thread=' || cleared.thread_id
+        ORDER BY notices.created_at DESC LIMIT 100`, [req.user.id]);
+      return res.json({ notifications: rows, unreadCount: rows.filter((row) => !row.readAt).length });
     } catch (error) { return next(error); }
   });
   app.post('/api/notifications/:id/read', authenticate, async (req, res, next) => {
     try {
-      await db.query('UPDATE notification_service_notifications SET read_at=now() WHERE id=$1 AND user_id=$2', [req.params.id, req.user.id]);
+      for (const table of ['notifications', 'notification_service_notifications']) await db.query(`UPDATE ${table} SET read_at=now() WHERE id=$1 AND user_id=$2`, [req.params.id, req.user.id]);
       return res.json({ ok: true });
     } catch (error) { return next(error); }
   });
   app.post('/api/notifications/read-thread/:threadId', authenticate, async (req, res, next) => {
     try {
-      await db.query("UPDATE notification_service_notifications SET read_at=now() WHERE user_id=$1 AND type='message' AND link LIKE $2 AND read_at IS NULL", [req.user.id, `%thread=${req.params.threadId}`]);
+      const thread = await db.one('SELECT id FROM threads WHERE id=$1 AND participants_json::jsonb @> $2::jsonb', [req.params.threadId, JSON.stringify([req.user.id])]);
+      if (!thread) return res.status(404).json({ error: 'Thread not found' });
+      await db.transaction((client) => markMessageNoticesRead(client, req.user.id, [thread.id], new Date().toISOString()));
       return res.json({ ok: true });
     } catch (error) { return next(error); }
   });
@@ -349,7 +678,7 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
   app.get('/api/profile', authenticate, async (req, res, next) => {
     try {
       const profile = await db.one('SELECT * FROM users WHERE id=$1', [req.user.id]);
-      const posts = await db.many('SELECT * FROM posts WHERE author_id=$1 ORDER BY created_at DESC', [req.user.id]);
+      const posts = await db.many("SELECT * FROM posts WHERE author_id=$1 AND status <> 'Encerrado' ORDER BY created_at DESC", [req.user.id]);
       const reputation = await db.one('SELECT COALESCE(ROUND(AVG(rating),1),0)::float AS rating, COUNT(*)::int AS count FROM reviews WHERE reviewee_id=$1', [req.user.id]);
       return res.json({ user: userView(profile), stats: { donations: Number(profile.donations || 0), received: Number(profile.received || 0), rating: Number(reputation?.rating || 0), carbonSavedPercent: Number(profile.carbon_saved_percent || 0) }, achievements: json(profile.achievements_json), reputation, reviews: [], posts: await Promise.all(posts.map((row) => postView(db, row, req.user.id))) });
     } catch (error) { return next(error); }
@@ -380,8 +709,8 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
           ? [...req.user.interests]
           : [];
       if (!name || !city) return res.status(400).json({ error: 'Name and city are required' });
-      if (!['person', 'business'].includes(accountType)) return res.status(400).json({ error: 'Invalid account type' });
-      if (accountType === 'business' && (!businessName || cnpj.length !== 14)) return res.status(400).json({ error: 'Business accounts require a legal name and valid CNPJ' });
+      if (!['person', 'business'].includes(accountType)) return res.status(400).json({ error: 'Selecione um tipo de conta válido.' });
+      if (accountType === 'business' && (!businessName || cnpj.length !== 14)) return res.status(400).json({ error: 'Contas empresariais precisam de razão social e CNPJ válido.' });
       await db.query(`UPDATE users SET name=$1, city=$2, neighborhood=$3, cep=$4, address=$5, account_type=$6, business_name=$7, cnpj=$8, interests_json=$9, last_active_at=now() WHERE id=$10`, [name, city, neighborhood, cep, address, accountType, businessName, cnpj, JSON.stringify(interests), req.user.id]);
       const refreshed = await db.one('SELECT * FROM users WHERE id=$1', [req.user.id]);
       return res.json({ user: userView(refreshed) });
@@ -475,27 +804,6 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
     } catch (error) { return next(error); }
   });
 
-  app.post('/api/posts/:id/complete', authenticate, async (req, res, next) => {
-    try {
-      const post = await db.one('SELECT * FROM posts WHERE id=$1', [req.params.id]);
-      if (!post) return res.status(404).json({ error: 'Post not found' });
-      if (post.author_id !== req.user.id) return res.status(403).json({ error: 'Only the owner can complete this post' });
-      const outcome = String(req.body?.outcome || '').trim();
-      if (!post.reserved_by || post.status !== 'Reservado') return res.status(400).json({ error: 'Reserve the item before completing the negotiation' });
-      if (!['Doado', 'Trocado'].includes(outcome)) return res.status(400).json({ error: 'Choose Doado or Trocado as the outcome' });
-      const negotiation = await db.one("SELECT * FROM negotiations WHERE post_id=$1 AND interested_id=$2 AND status='reserved'", [post.id, post.reserved_by]);
-      if (!negotiation) return res.status(400).json({ error: 'Reserved negotiation not found' });
-
-      const now = new Date().toISOString();
-      await db.transaction(async (client) => {
-        await client.query("UPDATE negotiations SET status='completed', completed_at=$1, updated_at=$1 WHERE id=$2", [now, negotiation.id]);
-        await client.query('UPDATE posts SET status=$1, completed_with=$2, completed_at=$3, updated_at=$3 WHERE id=$4', [outcome, post.reserved_by, now, post.id]);
-        await emit(client, 'negotiation.completed', { negotiationId: negotiation.id, postId: post.id, postTitle: post.title, ownerId: post.author_id, interestedId: post.reserved_by, outcome, completedAt: now }, req.correlationId);
-      });
-      return res.json({ post: await postView(db, await db.one('SELECT * FROM posts WHERE id=$1', [post.id]), req.user.id), negotiationId: negotiation.id });
-    } catch (error) { return next(error); }
-  });
-
   app.post('/api/negotiations/:id/reviews', authenticate, async (req, res, next) => {
     try {
       const negotiation = await db.one('SELECT * FROM negotiations WHERE id=$1', [req.params.id]);
@@ -518,8 +826,8 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
       const adminCheck = await db.one('SELECT role FROM users WHERE id=$1', [req.user.id]);
       if (adminCheck.role !== 'admin') return res.status(403).json({ error: 'Administrator access required' });
       const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
-      const totals = await db.one(`SELECT COUNT(*)::int AS total_users, (SELECT COUNT(*)::int FROM users WHERE suspended=false AND last_active_at >= $1)::int AS active_users, (SELECT COUNT(*)::int FROM posts)::int AS total_posts, (SELECT COUNT(*)::int FROM posts WHERE status IN ('Disponível','Reservado'))::int AS active_posts, (SELECT COUNT(*)::int FROM posts WHERE status='Doado')::int AS donations, (SELECT COUNT(*)::int FROM posts WHERE status='Trocado')::int AS exchanges, (SELECT COUNT(*)::int FROM collection_points)::int AS collection_points, (SELECT COUNT(*)::int FROM reports WHERE status='pending')::int AS reports, (SELECT COUNT(*)::int FROM users WHERE last_active_at >= $1)::int AS new_users FROM users`, [since]);
-      const categories = await db.many('SELECT category, COUNT(*)::int AS count FROM posts GROUP BY category ORDER BY count DESC LIMIT 8');
+      const totals = await db.one(`SELECT COUNT(*)::int AS total_users, (SELECT COUNT(*)::int FROM users WHERE suspended=false AND last_active_at >= $1)::int AS active_users, (SELECT COUNT(*)::int FROM posts WHERE status <> 'Encerrado')::int AS total_posts, (SELECT COUNT(*)::int FROM posts WHERE status IN ('Disponível','Reservado'))::int AS active_posts, (SELECT COUNT(*)::int FROM posts WHERE status='Doado')::int AS donations, (SELECT COUNT(*)::int FROM posts WHERE status='Trocado')::int AS exchanges, (SELECT COUNT(*)::int FROM collection_points)::int AS collection_points, (SELECT COUNT(*)::int FROM reports WHERE status='pending')::int AS reports, (SELECT COUNT(*)::int FROM users WHERE last_active_at >= $1)::int AS new_users FROM users`, [since]);
+      const categories = await db.many("SELECT category, COUNT(*)::int AS count FROM posts WHERE status <> 'Encerrado' GROUP BY category ORDER BY count DESC LIMIT 8");
       return res.json({ totals: { totalUsers: totals.total_users, activeUsers: totals.active_users, totalPosts: totals.total_posts, activePosts: totals.active_posts, donations: totals.donations, exchanges: totals.exchanges, collectionPoints: totals.collection_points, reports: totals.reports, newUsers: totals.new_users }, categories, impact: { itemsReused: Number(totals.donations) + Number(totals.exchanges), beneficiaries: 0, estimated: true } });
     } catch (error) { return next(error); }
   });
@@ -545,6 +853,43 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
       await db.query('UPDATE users SET suspended=$1 WHERE id=$2', [suspended, req.params.id]);
       return res.json({ suspended });
     } catch (error) { return next(error); }
+  });
+  app.delete('/api/admin/users/:id', authenticate, async (req, res, next) => {
+    try {
+      if (!await requireAdmin(req, res)) return;
+      if (req.params.id === req.user.id) return res.status(400).json({ error: 'You cannot delete your own account' });
+      const removed = await db.transaction(async (client) => {
+        const user = (await client.query('SELECT id FROM users WHERE id=$1 FOR UPDATE', [req.params.id])).rows[0];
+        if (!user) return false;
+        const financial = await client.query(`SELECT p.id FROM payments p
+          WHERE p.payer_id=$1 OR p.payee_id=$1 OR p.negotiation_id IN
+          (SELECT id FROM negotiations WHERE owner_id=$1 OR interested_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1))
+          LIMIT 1`, [user.id]);
+        if (financial.rowCount) throw Object.assign(new Error('Este usuário possui pagamentos vinculados e não pode ser excluído para preservar o histórico financeiro.'), { status: 409 });
+        await client.query('DELETE FROM reports WHERE reporter_id=$1 OR (target_type=$2 AND target_id IN (SELECT id FROM posts WHERE author_id=$1))', [user.id, 'post']);
+        await client.query('DELETE FROM reviews WHERE reviewer_id=$1 OR reviewee_id=$1 OR negotiation_id IN (SELECT id FROM negotiations WHERE owner_id=$1 OR interested_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1))', [user.id]);
+        await client.query('DELETE FROM messages WHERE sender_id=$1 OR thread_id IN (SELECT thread_id FROM negotiations WHERE owner_id=$1 OR interested_id=$1)', [user.id]);
+        await client.query('DELETE FROM delivery_incidents WHERE delivery_id IN (SELECT id FROM collection_deliveries WHERE negotiation_id IN (SELECT id FROM negotiations WHERE owner_id=$1 OR interested_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1)))', [user.id]);
+        await client.query('DELETE FROM collection_deliveries WHERE negotiation_id IN (SELECT id FROM negotiations WHERE owner_id=$1 OR interested_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1))', [user.id]);
+        await client.query('DELETE FROM negotiations WHERE owner_id=$1 OR interested_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM post_images WHERE post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM favorites WHERE post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM post_views WHERE post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM post_likes WHERE post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM posts WHERE author_id=$1', [user.id]);
+        await client.query('DELETE FROM favorites WHERE user_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM post_views WHERE user_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM post_likes WHERE user_id=$1 OR post_id IN (SELECT id FROM posts WHERE author_id=$1)', [user.id]);
+        await client.query('DELETE FROM blocked_users WHERE blocker_id=$1 OR blocked_id=$1', [user.id]);
+        await client.query('DELETE FROM notifications WHERE user_id=$1', [user.id]);
+        await client.query('DELETE FROM collection_point_suggestions WHERE user_id=$1', [user.id]);
+        await client.query('DELETE FROM users WHERE id=$1', [user.id]);
+        return true;
+      });
+      if (!removed) return res.status(404).json({ error: 'User not found' });
+      return res.json({ ok: true });
+    } catch (error) { if (error?.status) return res.status(error.status).json({ error: error.message }); return next(error); }
   });
 
   app.post('/api/collection-points/suggestions', authenticate, async (req, res, next) => {
@@ -637,7 +982,7 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
   app.get('/api/admin/posts', authenticate, async (req, res, next) => {
     try {
       if (!await requireAdmin(req, res)) return;
-      const rows = await db.many('SELECT * FROM posts ORDER BY created_at DESC LIMIT 200');
+      const rows = await db.many("SELECT * FROM posts WHERE status <> 'Encerrado' ORDER BY created_at DESC LIMIT 200");
       return res.json({ posts: await Promise.all(rows.map((row) => postView(db, row, req.user.id))) });
     } catch (error) { return next(error); }
   });
@@ -648,12 +993,19 @@ function registerPostgresRoutes(app, { db, jwtSecret, createToken, uid, publishe
       const removed = await db.transaction(async (client) => {
         const post = await client.query('SELECT id FROM posts WHERE id=$1 FOR UPDATE', [req.params.id]);
         if (!post.rowCount) return false;
+        const financial = await client.query('SELECT p.id FROM payments p JOIN negotiations n ON n.id=p.negotiation_id WHERE n.post_id=$1 LIMIT 1', [req.params.id]);
+        if (financial.rowCount) {
+          await client.query("UPDATE posts SET status='Encerrado', reserved_by=NULL, updated_at=now() WHERE id=$1", [req.params.id]);
+          await client.query('DELETE FROM favorites WHERE post_id=$1', [req.params.id]);
+          await client.query("DELETE FROM reports WHERE target_type='post' AND target_id=$1", [req.params.id]);
+          return 'archived';
+        }
         await client.query("DELETE FROM reports WHERE target_type='post' AND target_id=$1", [req.params.id]);
         await client.query('DELETE FROM posts WHERE id=$1', [req.params.id]);
         return true;
       });
       if (!removed) return res.status(404).json({ error: 'Post not found' });
-      return res.json({ ok: true });
+      return res.json({ ok: true, archived: removed === 'archived' });
     } catch (error) { return next(error); }
   });
 
